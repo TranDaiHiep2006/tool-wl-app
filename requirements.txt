@@ -1,0 +1,10 @@
+fastmcp>=2.0,<5
+uiautomation>=2.0
+mss>=10.0
+Pillow>=10.0
+winrt-Windows.Media.Ocr>=3.0
+winrt-Windows.Foundation>=3.0
+winrt-Windows.Graphics.Imaging>=3.0
+winrt-Windows.Storage>=3.0
+winrt-Windows.Storage.Streams>=3.0
+comtypes>=1.2
