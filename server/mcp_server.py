@@ -16,6 +16,7 @@ import uiautomation as uia
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from server import browser as browser_mod  # noqa: E402
+from server import browser_dom as browser_dom_mod  # noqa: E402
 from server import clipboard as clip_mod  # noqa: E402
 from server import ocr as ocr_mod  # noqa: E402
 from server import screenshots as ss_mod  # noqa: E402
@@ -233,6 +234,42 @@ def get_browser_tab_info() -> dict:
 )
 def read_clipboard() -> dict:
     return clip_mod.read_clipboard()
+
+
+# ---------------------- P2 tools 10/11: browser DOM -----------------------
+
+@mcp.tool(
+    name="get_page_text",
+    description=(
+        "Read the main visible text of the active browser tab. "
+        "Prefer this over screenshot/ocr when the user asks what is on a web page.\n"
+        "Returns the cleaned, boilerplate-stripped text of the page (up to ~8000 chars), "
+        "with `truncated=true` when the cap fired. Strictly read-only.\n"
+        "When to use: when the active tab is a real web page and you need its content as text.\n"
+        "When NOT to use: for browser internal pages (about:, chrome:, edge:) — returns "
+        "an actionable error. If no extension is loaded, returns a clear install-steps "
+        "error within ~10s; never hangs the server."
+    ),
+)
+def get_page_text(max_chars: int = 8000) -> dict:
+    return browser_dom_mod.get_page_text_sync(max_chars)
+
+
+@mcp.tool(
+    name="get_page_structure",
+    description=(
+        "Read the pruned interactive structure of the active browser tab: "
+        "headings (with level), links (text + href), buttons (text), and inputs "
+        "(label, type, name, placeholder). Up to ~200 items, with `truncated=true` "
+        "when the cap fired. Strictly read-only.\n"
+        "When to use: discover the headings/links/buttons/inputs of a web page "
+        "before any future action; or summarize page layout.\n"
+        "When NOT to use: for raw DOM (way too large) — this is already pruned. "
+        "If no extension is loaded, returns a clear install-steps error within ~10s."
+    ),
+)
+def get_page_structure(max_items: int = 200) -> dict:
+    return browser_dom_mod.get_page_structure_sync(max_items)
 
 
 # ---------------------- entry point ---------------------------------------

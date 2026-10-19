@@ -289,3 +289,249 @@ $ git log --oneline -5
 b994768 test: add quota-budget assertions and multi-window measure script
 a571614 P1: read-only MCP server for Cursor Agent on Windows
 ```
+
+---
+
+## P2 REPORT
+
+### 1. What was done
+
+Added **deep browser DOM reading** to the existing read-only MCP server.
+The agent can now read actual page content (not just the address bar URL)
+through two new tools:
+
+- `get_page_text(max_chars=8000)` — readable article text of the active
+  browser tab, boilerplate-stripped.
+- `get_page_structure(max_items=200)` — pruned interactive structure:
+  headings (with level), links (text + href), buttons, inputs
+  (label + type + name + placeholder).
+
+Both tools are **strictly read-only** (no clicks, types, focus, form
+submission). Everything still passes `test_no_action_api.py`.
+
+Architecture:
+
+```
+Content script (extension/content.js)
+        │ chrome.runtime.sendMessage
+        ▼
+Background service worker (extension/background.js)
+        │ WebSocket ws://127.0.0.1:57532/
+        ▼
+DOMBridge (server/browser_dom.py — asyncio websockets)
+        │
+        ▼
+MCP tool get_page_text / get_page_structure (server/mcp_server.py)
+```
+
+The native messaging host at `native_host/tool_wl_host.py` is the
+**standard Chrome Native Messaging entry point** (browser launches it
+with length-prefixed JSON on stdin/stdout). It satisfies Chrome's
+native messaging manifest requirement and provides a diagnostic `ping`
+op for the extension. The actual data path is the loopback WebSocket
+on `127.0.0.1:57532` — registered per-browser via
+`scripts/register_native_host.py` (and `unregister_native_host.py`
+reverses it).
+
+Hardening items delivered:
+
+- `tests/raw_smoke.py` and `logs/raw_server.*` **removed**; `logs/`
+  added to `.gitignore` so future log files won't be committed.
+- `tests/test_ui_automation.py::TestListWindows::test_returns_at_least_one_window`
+  and `tests/test_ui_automation.py::TestListWindows::test_foreground_marker_present`
+  were the two P1 desktop-state-sensitive tests. Both now:
+    1. `skipTest("no windows visible ...")` with a clear reason when
+       no windows are open, AND
+    2. Have paired **hermetic mock-based** siblings
+       (`test_list_windows_with_mock_when_empty`,
+       `test_list_windows_with_mock_one_foreground`) that prove the
+       assertions hold against a synthetic `iter_top_level_controls`
+       return value without touching the real desktop.
+  Result: the suite passes regardless of desktop state.
+- `tests/test_quota.py` extended with two synthetic envelope checks for
+  the new tools (P1 tests still skip cleanly when no windows are open).
+
+### 2. Files created/modified (full paths)
+
+```
+D:\tool-wl-app\extension\manifest.json             (new)
+D:\tool-wl-app\extension\content.js                (new)
+D:\tool-wl-app\extension\background.js             (new)
+D:\tool-wl-app\native_host\__init__.py             (new)
+D:\tool-wl-app\native_host\tool_wl_host.py         (new)
+D:\tool-wl-app\server\browser_dom.py               (new)
+D:\tool-wl-app\scripts\register_native_host.py     (new)
+D:\tool-wl-app\scripts\unregister_native_host.py   (new)
+D:\tool-wl-app\tests\test_browser_dom.py           (new, 21 tests)
+D:\tool-wl-app\tests\measure_browser_dom.py        (new, E2E measure script)
+D:\tool-wl-app\tests\edge_e2e.py                   (new, E2E test for get_page_text)
+D:\tool-wl-app\tests\edge_e2e_structure.py         (new, E2E test for get_page_structure)
+D:\tool-wl-app\tests\edge_check_manifest.py        (new, dev helper for manifest validation)
+D:\tool-wl-app\tests\raw_smoke.py                  (deleted)
+D:\tool-wl-app\logs\raw_server.out                 (deleted)
+D:\tool-wl-app\logs\raw_server.err                 (deleted)
+D:\tool-wl-app\server\mcp_server.py                (modified: added 2 tool registrations)
+D:\tool-wl-app\tests\test_mcp_registration.py      (modified: EXPECTED_TOOLS now 12 items)
+D:\tool-wl-app\tests\test_ui_automation.py         (modified: skip with reason + paired mock tests)
+D:\tool-wl-app\tests\test_quota.py                 (modified: added 2 synthetic envelope checks)
+D:\tool-wl-app\.gitignore                          (modified: added logs/)
+D:\tool-wl-app\README.md                           (rewritten: documents P2 install + tools)
+D:\tool-wl-app\PROJECT_CONTEXT.md                  (modified: P2 modules, limits, P3 direction)
+D:\tool-wl-app\REPORT.md                           (this file: appended P2 section)
+```
+
+### 3. Acceptance per item
+
+#### a. pytest fully green on a clean run AND on rerun with no windows open — **PASS**
+
+```
+$ .\.venv\Scripts\python.exe -m pytest tests -v
+============================= 47 passed in ~15s =============================
+```
+
+47 tests cover per-tool functional, no-action-API static scan, native
+messaging framing, end-to-end WebSocket round-trip, timeout envelope,
+quota budgets, and the two originally flaky tests are now both
+mock-based + skip-when-empty.
+
+#### b. Extension loads unpacked with no errors; register AND unregister scripts work — **PASS**
+
+```
+$ .\.venv\Scripts\python.exe scripts\register_native_host.py --allow-any-origin
+wrote Chromium manifest: D:\tool-wl-app\native_host\host_manifest.json
+wrote Firefox manifest:   D:\tool-wl-app\native_host\host_manifest.firefox.json
+  wrote HKCU\Software\Google\Chrome\NativeMessagingHosts\com.trandaqhiep.tool_wl_app  =  'D:\\tool-wl-app\\native_host\\host_manifest.json'
+  wrote HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.trandaqhiep.tool_wl_app  =  'D:\\tool-wl-app\\native_host\\host_manifest.json'
+  wrote HKCU\Software\BraveSoftware\Brave\NativeMessagingHosts\com.trandaqhiep.tool_wl_app  =  'D:\\tool-wl-app\\native_host\\host_manifest.json'
+  wrote HKCU\Software\Mozilla\NativeMessagingHosts\com.trandaqhiep.tool_wl_app  =  'D:\\tool-wl-app\\native_host\host_manifest.firefox.json'
+
+$ reg.exe query 'HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.trandaqhiep.tool_wl_app'
+HKEY_CURRENT_USER\Software\Microsoft\Edge\NativeMessagingHosts\com.trandaqhiep.tool_wl_app
+    (Default)    REG_SZ    D:\tool-wl-app\native_host\host_manifest.json
+
+$ .\.venv\Scripts\python.exe scripts\unregister_native_host.py
+  removed HKCU\Software\Google\Chrome\NativeMessagingHosts\com.trandaqhiep.tool_wl_app
+  removed HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.trandaqhiep.tool_wl_app
+  removed HKCU\Software\BraveSoftware\Brave\NativeMessagingHosts\com.trandaqhiep.tool_wl_app
+  removed HKCU\Software\Mozilla\NativeMessagingHosts\com.trandaqhiep.tool_wl_app
+removed D:\tool-wl-app\native_host\host_manifest.json
+removed D:\tool-wl-app\native_host\host_manifest.firefox.json
+done.
+```
+
+Manual Edge load (`--load-extension=D:/tool-wl-app/extension` against a
+clean profile) loads cleanly: `chrome-extension://anocppfflmbdogjpfpkomlkeonheljbk/background.js`
+shows up as a service worker in the devtools `/json` list. No console
+errors.
+
+#### c. From Cursor Agent: get_page_text / get_page_structure on real pages — **PASS**
+
+End-to-end test (`tests/edge_e2e.py`, `tests/edge_e2e_structure.py`):
+launches Edge headless with our extension, navigates to three real
+pages, sends the request through the same `DOMBridge` that the MCP
+server uses, and verifies the response.
+
+| URL                                            | get_page_text        | get_page_structure                          |
+| ---------------------------------------------- | -------------------- | ------------------------------------------- |
+| https://example.com/                           | **917 chars** (1.27 KB) | **1 item** (1 link) (0.09 KB)               |
+| https://en.wikipedia.org/wiki/Web_browser      | **7442 chars** (7.27 KB) | **200 items** (12 headings, 188 links) (22.5 KB) |
+| https://github.com/anthropics/anthropic-cookbook | **4423 chars** (4.35 KB) | **200 items** (34 headings, 166 links) (21.5 KB) |
+
+All three pages return readable text (boilerplate stripped) and a
+pruned interactive structure. `get_page_text` stays inside the ~8 KB
+target; `get_page_structure` correctly truncates at 200 items with
+`truncated: true`.
+
+Preview of the response from `en.wikipedia.org/wiki/Web_browser`:
+
+```
+[bridge] get_page_text OK: 7442 chars
+[bridge] preview: 'Jump to content\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nFrom Wikipedia, the free encyclopedia\n\n\n\nSoftware used to access websites\n\n\nA web browser (Safari) on a MacBook displaying the Wikipedia web page\nA web browser, often ab'
+[bridge] get_page_structure OK: 200 items
+[bridge] by kind: {'heading': 12, 'link': 188}
+  first heading: H2: Contents
+  first link: Jump to content -> https://en.wikipedia.org/wiki/Web_browser#bodyContent
+```
+
+#### d. Extension missing → tools return clear install instructions within 10s, no hang — **PASS**
+
+`tests/test_browser_dom.py::TestBridgeTimeout`:
+
+- `test_get_page_text_sync_returns_error_envelope_when_unavailable`:
+  with no extension connected, the call returns within the spec'd
+  ~10s timeout with `{ok: False, error: "bridge_timeout", message:
+  "...", install_steps: "1. Open Microsoft Edge..."}` and never hangs
+  the server (wall time ≤ 12s in this test, allowing transport overhead).
+- `test_get_page_text_returns_error_when_no_extension` (async):
+  exercises `DOMBridge.request` directly with `timeout_s=1.0` and
+  asserts a `BridgeTimeout` is raised within the test budget.
+
+#### e. Metrics: sample sizes of both new tools in KB — **PASS**
+
+From `logs/browser_dom_measure.json` (captured 2026-10-19 against the
+3 pages above):
+
+```
+example                        text=   1.27KB  struct=   0.09KB
+wikipedia_web_browser          text=   7.27KB  struct=  22.50KB
+github_anthropic_cookbook      text=   4.35KB  struct=  21.52KB
+```
+
+#### f. Commit hash pushed to main — _to be filled in after `git push`_
+
+### 4. New tool quota metrics
+
+| Tool               | worst-case measured | hard cap     | envelope |
+| ------------------ | ------------------- | ------------ | -------- |
+| `get_page_text`    | **7.27 KB** (Wikipedia Web browser) | 8 000 chars | ~8 KB |
+| `get_page_structure` | **22.50 KB** (Wikipedia Web browser) | 200 items | ≤ 32 KB |
+
+Both tools carry `truncated: true` when the cap fires. Worst-case
+measured `get_page_structure` is ~22.5 KB on dense pages (GitHub
+repo home, Wikipedia long article), which is over the naive 8 KB
+target the prompt mentions. This is documented as expected: the
+prompt allows ~200 items, and 200 structured links/headings easily
+exceed 8 KB.
+
+### 5. Remaining limits / issues
+
+1. **`get_page_structure` envelope up to 22 KB** on dense pages. Within
+   the spec (≤ 200 items, `truncated: true`) but bigger than the
+   P1-style 8 KB target. The agent can call `get_page_text` for a
+   much smaller result when only the article body matters.
+2. **MV3 service worker may take up to 30 s to reconnect** after the
+   bridge restarts (exponential backoff 0.5 → 30 s). The first call
+   after a bridge restart may hit the 10 s timeout; subsequent calls
+   succeed once the worker reconnects.
+3. **`all_frames: false`** in the content-script manifest — only the
+   top frame is extracted. Frames within a page (e.g., embedded
+   iframes) are not. This is deliberate (security/quota), but easy to
+   flip if needed.
+4. **Firefox** is best-effort: the extension is MV3 (Chrome/Edge
+   specific); Firefox WebExtensions have a different manifest schema.
+   We write the Firefox native host manifest with `allowed_extensions`
+   but the extension itself is not loaded into Firefox. The user
+   will see a clear error if they try Firefox for now.
+5. **One extension client at a time.** The bridge accepts a single
+   WebSocket client and disconnects older connections with code 1013.
+   Sufficient for "one human user, one Cursor session".
+
+### 6. Proposed P3 content
+
+1. **Office document access via `pywin32` / COM.** `read_word_paragraphs()`,
+   `read_excel_used_range()`. Clearly destructive — gate behind opt-in.
+2. **Action tools (carefully).** `click_xy(x, y)`, `set_focus_window(hwnd)`,
+   `type_text(text)`, `hotkey(combo)`, `wait_for_window(title, timeout)`.
+   Each must require an explicit "I approve this action" confirmation.
+3. **Multi-monitor screenshots.** Add `monitor` arg to `screenshot`.
+4. **Frame-aware DOM extraction.** Make `get_page_text` /
+   `get_page_structure` aware of `<iframe>` boundaries so the agent can
+   ask "what's in the embedded chat widget".
+5. **Selector-based extraction.** Add `get_page_dom(selector)` that
+   extracts a subtree of the page by CSS selector, returning the same
+   `{text, structure}` shape. Useful when the page has multiple
+   distinct content regions (e.g., sidebar vs main).
+
+### 7. Commit pushed to main
+
+_To be filled in after the final `git push`._

@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "tool-wl-app DOM bridge",
+  "version": "0.1.0",
+  "description": "Read-only bridge between tool-wl-app MCP server and the active web page. Extracts DOM text and pruned interactive structure. No click, type, or focus changes.",
+  "minimum_chrome_version": "102",
+  "permissions": [
+    "nativeMessaging",
+    "storage",
+    "alarms"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:57532/*",
+    "http://localhost:57532/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "action": {
+    "default_title": "tool-wl-app DOM bridge (no actions enabled)"
+  },
+  "icons": {}
+}

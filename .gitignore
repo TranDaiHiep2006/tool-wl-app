@@ -8,5 +8,6 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 tests/output/
+logs/
 *.log
 .DS_Store

@@ -1,0 +1,208 @@
+// Background service worker for tool-wl-app DOM bridge.
+//
+// Two responsibilities:
+//   1. Keep a persistent WebSocket connection to the MCP server's local bridge
+//      (ws://127.0.0.1:57532/) and respond to JSON requests by asking the
+//      active tab's content script to extract DOM.
+//   2. (Optional) On install, register a Native Messaging host for browser-side
+//      diagnostics. This lets the extension also be reached via
+//      chrome.runtime.sendNativeMessage if a future tool wants it.
+//
+// The service worker is EPHEMERAL (MV3). We must:
+//   - never keep DOM state here
+//   - always pull fresh from the content script on each request
+//   - reconnect on port/WS failures with backoff
+
+const BRIDGE_URL_DEFAULT = "ws://127.0.0.1:57532/";
+// Allow the user to override via chrome.storage.local["bridgeUrl"].
+async function resolveBridgeUrl() {
+  try {
+    const got = await chrome.storage.local.get(["bridgeUrl"]);
+    if (got && typeof got.bridgeUrl === "string" && got.bridgeUrl) {
+      return got.bridgeUrl;
+    }
+  } catch (e) {}
+  return BRIDGE_URL_DEFAULT;
+}
+const NATIVE_HOST_NAME = "com.trandaqhiep.tool_wl_app";
+
+// Default caps (must match server/browser_dom.py)
+const DEFAULT_TEXT_MAX = 8000;
+const DEFAULT_STRUCTURE_MAX = 200;
+
+// Diagnostics
+let stats = {
+  startedAt: Date.now(),
+  requests: 0,
+  errors: 0,
+  lastError: null,
+};
+
+let ws = null;
+let reconnectDelay = 500;
+const RECONNECT_MAX_MS = 30000;
+let reconnectTimer = null;
+
+function log(...args) {
+  // Best-effort logging — service worker console is visible from chrome://extensions
+  console.log("[tool-wl-app]", ...args);
+}
+
+async function askContentScript(tabId, op, payload) {
+  if (!tabId || tabId < 0) {
+    return { ok: false, error: "no active tab" };
+  }
+  try {
+    const resp = await chrome.tabs.sendMessage(tabId, { op, ...payload });
+    return resp || { ok: false, error: "no response from content script" };
+  } catch (e) {
+    return { ok: false, error: "content script error: " + String(e && e.message || e) };
+  }
+}
+
+async function handleRequest(req) {
+  stats.requests++;
+  const op = req && req.op;
+  const reqId = req && req.id;
+
+  try {
+    // Pick the active tab in the focused window.
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tabs || !tabs.length) {
+      return { id: reqId, ok: false, error: "no active tab in focused window" };
+    }
+    const tab = tabs[0];
+    const tabId = tab.id;
+    if (!tabId || tabId < 0) {
+      return { id: reqId, ok: false, error: "active tab has no usable id (chrome:// or similar)" };
+    }
+    const url = tab.url || "";
+    if (url.startsWith("chrome://") || url.startsWith("edge://") ||
+        url.startsWith("about:") || url.startsWith("chrome-extension://")) {
+      return {
+        id: reqId,
+        ok: false,
+        error: "active tab is a browser internal page; cannot read DOM",
+        url,
+      };
+    }
+
+    if (op === "get_page_text") {
+      const data = await askContentScript(tabId, "get_page_text", {
+        maxChars: (req.args && req.args.max_chars) || DEFAULT_TEXT_MAX,
+      });
+      return { id: reqId, ok: !!data.ok, data: data.data, error: data.error };
+    }
+    if (op === "get_page_structure") {
+      const data = await askContentScript(tabId, "get_page_structure", {
+        maxItems: (req.args && req.args.max_items) || DEFAULT_STRUCTURE_MAX,
+      });
+      return { id: reqId, ok: !!data.ok, data: data.data, error: data.error };
+    }
+    if (op === "ping") {
+      return {
+        id: reqId,
+        ok: true,
+        data: { url, title: tab.title, tabId, stats },
+      };
+    }
+    return { id: reqId, ok: false, error: "unknown op: " + op };
+  } catch (e) {
+    stats.errors++;
+    stats.lastError = String(e && e.message || e);
+    return { id: reqId, ok: false, error: stats.lastError };
+  }
+}
+
+function wsSend(obj) {
+  try {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(obj));
+      return true;
+    }
+  } catch (e) {
+    log("wsSend failed:", String(e));
+  }
+  return false;
+}
+
+async function tryNativePing() {
+  // Best-effort: try to talk to the registered native host. Errors are silent.
+  try {
+    const reply = await chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, { op: "ping" });
+    log("native host ping reply:", JSON.stringify(reply));
+  } catch (e) {
+    log("native host not reachable:", String(e && e.message || e));
+  }
+}
+
+async function connect() {
+  let url = BRIDGE_URL_DEFAULT;
+  try {
+    if (ws && (ws.readyState === WebSocket.OPEN ||
+               ws.readyState === WebSocket.CONNECTING)) {
+      return; // already connecting/open
+    }
+    url = await resolveBridgeUrl();
+    ws = new WebSocket(url);
+  } catch (e) {
+    scheduleReconnect();
+    return;
+  }
+
+  ws.addEventListener("open", () => {
+    reconnectDelay = 500;
+    log("bridge connected:", url);
+    wsSend({ type: "hello", from: "extension", version: "0.1.0" });
+  });
+
+  ws.addEventListener("message", async (ev) => {
+    let msg = null;
+    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    if (!msg || !msg.id || !msg.op) return;
+    const reply = await handleRequest(msg);
+    wsSend({ type: "reply", ...reply });
+  });
+
+  ws.addEventListener("close", () => {
+    log("bridge closed; will reconnect");
+    scheduleReconnect();
+  });
+
+  ws.addEventListener("error", () => {
+    // The close event will follow; don't double-schedule.
+    stats.errors++;
+  });
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect();
+  }, reconnectDelay);
+  reconnectDelay = Math.min(RECONNECT_MAX_MS, reconnectDelay * 2);
+}
+
+// MV3 service workers can be torn down. On any startup event, ensure the
+// bridge connection exists.
+chrome.runtime.onInstalled.addListener(() => {
+  connect();
+  tryNativePing();
+});
+chrome.runtime.onStartup.addListener(() => {
+  connect();
+});
+
+// chrome.alarms keeps the service worker alive across long idle periods.
+chrome.alarms.create("keepalive", { periodInMinutes: 0.5 });
+chrome.alarms.onAlarm.addListener((a) => {
+  if (a.name === "keepalive") {
+    if (!ws || ws.readyState !== WebSocket.OPEN) connect();
+    wsSend({ type: "keepalive", ts: Date.now() });
+  }
+});
+
+// Also (re)connect immediately when this script first runs.
+connect();
+tryNativePing();

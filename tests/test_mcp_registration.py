@@ -24,6 +24,9 @@ EXPECTED_TOOLS = {
     "find_text_on_screen",
     "get_browser_tab_info",
     "read_clipboard",
+    # P2: browser DOM (read-only)
+    "get_page_text",
+    "get_page_structure",
 }
 
 
