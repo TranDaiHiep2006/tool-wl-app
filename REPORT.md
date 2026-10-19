@@ -477,7 +477,19 @@ wikipedia_web_browser          text=   7.27KB  struct=  22.50KB
 github_anthropic_cookbook      text=   4.35KB  struct=  21.52KB
 ```
 
-#### f. Commit hash pushed to main — _to be filled in after `git push`_
+#### f. Commit hash pushed to main — **PASS**
+
+`6a24569ccc2d0aa3ccc088333e3b9ecd953831f1` — pushed to `main` at
+`https://github.com/TranDaiHiep2006/tool-wl-app`.
+
+```
+$ git log --oneline -5
+6a24569 P2: deep browser DOM reading via MV3 extension + hardening
+1a6fb38 docs: P1 REPORT with acceptance per acceptance + P2 direction
+2bc32d1 chore: drop exploratory smoke scripts
+b994768 test: add quota-budget assertions and multi-window measure script
+a571614 P1: read-only MCP server for Cursor Agent on Windows
+```
 
 ### 4. New tool quota metrics
 
@@ -534,4 +546,5 @@ exceed 8 KB.
 
 ### 7. Commit pushed to main
 
-_To be filled in after the final `git push`._
+`6a24569ccc2d0aa3ccc088333e3b9ecd953831f1` — pushed to `main` at
+`https://github.com/TranDaiHiep2006/tool-wl-app`.
