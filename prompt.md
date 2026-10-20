@@ -1,70 +1,34 @@
-# P3 — tool-wl-app: Read Office file contents via COM + lock down the browser bridge
+Read PROJECT_CONTEXT.md and REPORT.md first for full project context. This is phase P4: add ACTION capabilities to the MCP server, behind a strict safety gate. All 15 existing read-only tools and their behavior must stay unchanged. Commit and push to main when done, and update PROJECT_CONTEXT.md and README.md to document P4 (new tools, the gate, the config file, how the user edits the allowlist).
 
-## 1. Role
-You are a senior Python developer, experienced with Windows COM automation (pywin32), WebSocket security, and MCP servers.
+GOAL — add 3 action tools (18 tools total) that operate apps via UI Automation patterns, never via raw screen coordinates:
+1. click_control — activate a control (button, menu item, checkbox...) via its UIA pattern.
+2. type_text — set the text of an editable control via ValuePattern.
+3. focus_window — bring an allowlisted app's window to the foreground.
 
-## 2. Background & Goal
-- P1: read-only MCP server (UIA, screenshot, OCR). P2: MV3 extension + get_page_text/get_page_structure via a localhost WebSocket bridge (ws://127.0.0.1:57532). FIRST read D:\tool-wl-app\PROJECT_CONTEXT.md and D:\tool-wl-app\REPORT.md — they are the source of truth. Do not re-derive the architecture.
-- P3 has two goals: (A) read the CONTENTS of open Office files (Word/Excel/PowerPoint) — still READ-ONLY; (B) decide and lock down the browser bridge transport (section 3B).
-- Repo: https://github.com/TranDaiHiep2006/tool-wl-app, work in D:\tool-wl-app, pull latest, commit + push to main.
-- Communicate with me in English. P1/P2 quota rules still apply: batch commands, read with purpose, fix in clusters, size-limited outputs.
+THE SAFETY GATE (core of this phase — implement exactly)
+Every mutating action (click_control, type_text) is two-phase:
+- Phase 1, PLAN: called without a plan_id, the tool only VALIDATES: it resolves the target to exactly one control, checks all gate rules below, and returns a plan {plan_id, description, expires_in_s: 300}. description is one human-readable sentence stating exactly what will happen: window title, control name, action; for type_text it also includes the control's CURRENT value (truncated to 200 chars) and the new text (truncated), because SetValue overwrites. NOTHING is executed in phase 1.
+- Phase 2, EXECUTE: called again with the same arguments plus that plan_id. The server re-checks all gate rules, verifies the plan exists, is unexpired (300s), unused, and bound to the same tool + same resolved control + same arguments (for type_text, identical text), then performs the action and consumes the plan (single-use). Any mismatch: structured error, no action.
+Gate rules, checked in BOTH phases:
+- Master config config/actions.json (create with these defaults if missing): enabled=true, allowed_processes=["notepad.exe"], deny_labels=["delete", "format", "uninstall", "shut down", "pay now", "remove account"].
+- enabled=false, or target window's process not in allowed_processes: refuse.
+- A file named config/STOP_ACTIONS exists: refuse everything.
+- Target control's Name contains any deny_labels entry (case-insensitive): refuse.
+- Log every plan, execute and refusal as one JSON line appended to logs/actions.log (create the dir, gitignore logs/): timestamp, event, tool, process, window title, control name, detail/result.
+focus_window needs no plan, but allowlist + STOP check + logging still apply. Windows may refuse foreground changes from a background process: if SetForegroundWindow fails, return an honest error, never fake success.
 
-## 3. Scope — DO and DO NOT
-DO:
-A. Office COM reading (pywin32, read-only, never save/modify):
-   1. `read_word_text()` — full text of the ACTIVE Word document via GetActiveObject("Word.Application"). No active doc → clear message.
-   2. `read_excel_values(sheet=None, max_rows=200, max_cols=50)` — values of the used range (or the named sheet) of the ACTIVE workbook. Trim empty trailing rows/cols. Truncate + report.
-   3. `read_powerpoint_text()` — text of all slides of the ACTIVE presentation, as a per-slide list. Truncate + report.
-   If Office is not running or no document is open → return a clear message. NEVER launch Office, never crash the server.
-B. Browser bridge transport decision — pick ONE and implement it:
-   - Option 1 (recommended): keep the WebSocket bridge but lock it down: bind strictly to 127.0.0.1, require a per-install secret token (generated once, stored in a local config file; the extension sends it on connect; reject connections without it), remove any `--allow-any-origin` dev bypass from default paths, document the token location.
-   - Option 2: make Native Messaging the live transport (reuse the P2 native_host + registry scripts) and remove the WebSocket bridge entirely.
-   Document the choice and WHY in PROJECT_CONTEXT.md. Either way: no unauthenticated localhost listener left open by default.
-DO NOT:
-- Any action tools (click/type/focus) — still forbidden.
-- Saving or modifying Office files — read-only means read-only. The COM code must never call Save/SaveAs/Close-with-save.
-- Starting Office applications — attach only to already-running instances.
+TARGETING
+Same selector style as get_control_text: window by hwnd or process_name; control by automation_id and/or exact name and/or control_type. Resolution must yield exactly one control: 0 or 2+ matches = structured error, no plan. click_control tries patterns in this order: Invoke, Toggle, SelectionItem, ExpandCollapse, and reports which pattern was used; none supported = error. NO fallback to coordinate clicking; no SendInput anywhere in this phase. type_text requires ValuePattern and uses SetValue.
 
-## 4. Technical Decisions — FINAL where stated
-- pywin32 for COM. Use GetActiveObject; never CreateObject (do not launch).
-- New tools in server/office_com.py, wired into mcp_server.py. English descriptions + size limits + priority line ("prefer read_word_text / read_excel_values over OCR/screenshot for Office content").
-- COM hygiene: release objects properly so no WINWORD.EXE/EXCEL.EXE handle is leaked by our reads.
-- Vietnamese Unicode text must survive end-to-end — test with Vietnamese content in each app.
-- If Office COM is unusable on this machine (not installed, Click-to-Run quirks): REPORT before changing approach (same rule as P1/P2).
+TOOL DESCRIPTIONS
+The MCP descriptions of the 3 new tools must instruct the calling agent: this tool ACTS on the user's real desktop; always call without plan_id first, present the returned plan description to the user, and execute only after the user agrees; never chain plan+execute silently.
 
-## 5. Common Pitfalls — read before coding
-- GetActiveObject raises when the app isn't running — catch it and return the "not running" message.
-- Large workbooks: never dump whole sheets — used-range + caps only.
-- Never block the MCP server event loop on COM calls that might hang — timeouts where feasible.
-- The bridge lockdown must not break the existing P2 tools — re-run their end-to-end after the change.
+TESTS (previous suite must stay green)
+- Gate unit tests with mocked UIA/config: execute without plan refused; expired plan refused; reusing a consumed plan refused; executing a plan with different text refused; non-allowlisted process refused; STOP_ACTIONS present refused; deny-label control refused; enabled=false refused.
+- Extend the static scan (tests/test_no_action_api.py): action APIs (Invoke, SetValue, SendInput and friends) may exist ONLY in the new action module(s); all read-only modules stay clean.
+- E2E script outside the default pytest run (like tests/verify_sw_chrome.py): tests/manual_actions_e2e.py launches Notepad (test may use its own temp config; shipped defaults unchanged), plan+execute type_text of a known string, reads the text back through the existing read path and asserts equality; then plan+execute a click on a pattern-supporting control and assert its effect. If Notepad offers no invocable control, use Calculator buttons for the click part (test config only). The script prints clear PASS/FAIL evidence.
+- Final full pytest run: all green.
 
-## 6. Workflow (follow in order)
-1. Read PROJECT_CONTEXT.md + REPORT.md.
-2. Implement server/office_com.py (3 tools); wire into mcp_server.py.
-3. Implement the bridge decision (section 3B); update/remove code accordingly; update README install steps.
-4. Tests: unit tests with mocks for COM + caps; test_no_action_api must still pass (extend its forbidden list with Save/SaveAs if missing); full suite green on clean run and rerun.
-5. Manual end-to-end: with Word/Excel/PowerPoint open on real files (include Vietnamese text), restart Cursor, call the 3 tools from Cursor Agent and confirm correct content (spot-check 3 Excel cells).
-6. Re-verify get_page_text/get_page_structure still work after the bridge change.
-7. Update README.md, PROJECT_CONTEXT.md, REPORT.md (append P3 section).
-8. Measure sample output sizes (KB).
-9. Commit + push main. Write the REPORT per section 8 template.
+OUT OF SCOPE (do not build): raw coordinate clicks, drag, hotkeys via SendInput; writing to Office via COM (Office stays read-only: no Save, no setting cells, nothing); DOM actions in the browser extension (extension stays read-only); macros or batched action sequences; anything elevated.
 
-## 7. Acceptance (report REAL results per item)
-- [ ] pytest fully green (clean run + rerun).
-- [ ] test_no_action_api passes (no action APIs, no Save/SaveAs in server code).
-- [ ] From Cursor Agent with Office apps open: read_word_text returns document text; read_excel_values returns correct cell values (3 spot-checked cells); read_powerpoint_text lists slide texts. Vietnamese text intact.
-- [ ] Office not running → clear "not running" message, server stays up.
-- [ ] Bridge: no unauthenticated localhost listener by default — verify by connecting without token → rejected (or WS bridge removed entirely).
-- [ ] Metrics: sample sizes of the 3 new tools in KB.
-- [ ] Commit hash pushed to main.
-
-## 8. REPORT (mandatory — write after section 7; copy the template below and fill it in)
-## P3 REPORT
-1. What was done: ...
-2. Files created/modified (full paths): ...
-3. Acceptance per item (pass/fail + brief evidence): ...
-4. New tool quota metrics: read_word_text ? KB / read_excel_values ? KB / read_powerpoint_text ? KB
-5. Bridge decision: chosen option + why: ...
-6. Remaining limits / issues: ...
-7. Proposed P4 content: ...
-8. Commit <hash> pushed to main.
+REPORT (append to REPORT.md and paste in this chat): the gate design as implemented, config format, the 3 tools + new total count, full test results including the E2E evidence (what was typed/clicked, what was read back), one real refusal output shown verbatim (e.g. non-allowlisted process), the commit hash, and manual verification steps for the user in Cursor using Notepad.

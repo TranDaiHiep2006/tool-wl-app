@@ -1,0 +1,5 @@
+{
+  "enabled": true,
+  "allowed_processes": ["notepad.exe"],
+  "deny_labels": ["delete", "format", "uninstall", "shut down", "pay now", "remove account"]
+}

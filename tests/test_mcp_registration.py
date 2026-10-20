@@ -31,6 +31,10 @@ EXPECTED_TOOLS = {
     "read_word_text",
     "read_excel_values",
     "read_powerpoint_text",
+    # P4: Action tools (with safety gate)
+    "click_control",
+    "type_text",
+    "focus_window",
 }
 
 
@@ -51,7 +55,7 @@ class TestMCPRegistration(unittest.TestCase):
 
         names = asyncio.run(_go())
         # FastMCP may add internal tools (e.g., debug); we only assert the spec tools are present.
-        # P1 had 9 + 1 (P2 added 2 = 11). P3 added 3 Office tools → 15 total.
+        # P1 had 9 + 2 (P2) + 3 (P3) + 3 (P4) = 18 total.
         self.assertEqual(len(names & EXPECTED_TOOLS), len(EXPECTED_TOOLS))
 
 

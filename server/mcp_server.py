@@ -22,6 +22,7 @@ from server import ocr as ocr_mod  # noqa: E402
 from server import office_com as office_mod  # noqa: E402
 from server import screenshots as ss_mod  # noqa: E402
 from server import ui_automation as ui_mod  # noqa: E402
+from server import actions as actions_mod  # noqa: E402
 
 from fastmcp import FastMCP  # noqa: E402
 from server import browser_dom as browser_dom_mod  # noqa: E402
@@ -346,6 +347,82 @@ def read_excel_values(
 )
 def read_powerpoint_text(max_slides: int = 100) -> dict:
     return office_mod.read_powerpoint_text(max_slides=max_slides)
+
+
+# ---------------------- P4 tools 16/17/18: Action tools (with safety gate) -
+
+@mcp.tool(
+    name="click_control",
+    description=(
+        "ACT ON THE REAL DESKTOP — activates a control (button, menu item, checkbox...) "
+        "via its UIA pattern (Invoke > Toggle > SelectionItem > ExpandCollapse).\n"
+        "ALWAYS call without plan_id FIRST, present the plan description to the user, "
+        "and execute only after the user agrees. NEVER chain plan+execute silently.\n"
+        "Two-phase: Phase 1 (no plan_id) validates the target and returns a plan. "
+        "Phase 2 (with plan_id from Phase 1) performs the click. Plans expire after "
+        "300 seconds and can only be used once.\n"
+        "Safety gate: requires the target window's process to be in "
+        "config/actions.json allowed_processes; blocked if "
+        "config/STOP_ACTIONS exists or the control name contains deny labels.\n"
+        "NO coordinate clicking; NO SendInput anywhere in this phase.\n"
+        "When to use: user wants to click a button/menu item and has approved the action.\n"
+        "When NOT to use: for read-only operations — use get_ui_tree instead."
+    ),
+)
+def click_control(
+    window: str,
+    automation_id: Optional[str] = None,
+    name: Optional[str] = None,
+    plan_id: Optional[str] = None,
+) -> dict:
+    return actions_mod.click_control(window, automation_id, name, plan_id)
+
+
+@mcp.tool(
+    name="type_text",
+    description=(
+        "ACT ON THE REAL DESKTOP — sets the text of an editable control via UIA "
+        "ValuePattern. WARNING: SetValue OVERWRITES the existing text.\n"
+        "ALWAYS call without plan_id FIRST, present the plan description (showing "
+        "the current value) to the user, and execute only after the user agrees. "
+        "NEVER chain plan+execute silently.\n"
+        "Two-phase: Phase 1 (no plan_id) validates the target and returns a plan "
+        "with the control's current value and new text. Phase 2 (with plan_id) "
+        "performs the SetValue. Plans expire after 300 seconds and can only be "
+        "used once.\n"
+        "Safety gate: requires the target window's process to be in "
+        "config/actions.json allowed_processes; blocked if "
+        "config/STOP_ACTIONS exists or the control name contains deny labels.\n"
+        "When to use: user wants to type into a text field and has approved the action.\n"
+        "When NOT to use: for read-only text reading — use get_control_text instead."
+    ),
+)
+def type_text(
+    window: str,
+    text: str,
+    automation_id: Optional[str] = None,
+    name: Optional[str] = None,
+    plan_id: Optional[str] = None,
+) -> dict:
+    return actions_mod.type_text(window, text, automation_id, name, plan_id)
+
+
+@mcp.tool(
+    name="focus_window",
+    description=(
+        "ACT ON THE REAL DESKTOP — brings an allowlisted app's window to the "
+        "foreground via SetForegroundWindow. Confirm with the user before calling.\n"
+        "Safety gate: requires the target window's process to be in "
+        "config/actions.json allowed_processes; blocked if "
+        "config/STOP_ACTIONS exists.\n"
+        "If SetForegroundWindow fails (Windows may refuse foreground changes "
+        "from a background process), returns an honest error, never fakes success.\n"
+        "When to use: user wants to switch focus to a specific window.\n"
+        "When NOT to use: for read-only window queries — use list_windows instead."
+    ),
+)
+def focus_window(window: str) -> dict:
+    return actions_mod.focus_window(window)
 
 
 # ---------------------- entry point ---------------------------------------

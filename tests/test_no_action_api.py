@@ -1,8 +1,9 @@
-"""Automated scan: assert the server code uses NO action APIs.
+"""Automated scan: assert the server code uses NO action APIs outside the
+designated action module.
 
-P1 is strictly read-only. The action-API symbols below come from
-`uiautomation` and Win32. If any of them appears in `server/*.py`,
-the test fails.
+P1-P3 are strictly read-only. The action-API symbols below come from
+`uiautomation` and Win32. They are ALLOWED in `server/actions.py` (P4)
+but MUST NOT appear in any other `server/*.py`.
 
 Run via: `python -m pytest tests/test_no_action_api.py -v`
 """
@@ -15,7 +16,7 @@ import re
 import unittest
 
 
-# Action APIs that must never appear in P1 source code.
+# Action APIs that must never appear in server/*.py EXCEPT actions.py.
 FORBIDDEN_SYMBOLS = {
     # uiautomation actions
     "Click",
@@ -84,6 +85,29 @@ FORBIDDEN_SYMBOLS = {
     # prog-id or CreateObject() would launch an Office instance, which the
     # spec explicitly forbids ("never launch Office").
     "CreateObject",
+    # P4: UIA action patterns — only allowed in server/actions.py.
+    "Invoke",
+    "Toggle",
+    "SelectionItem",
+    "ExpandCollapse",
+    "ValuePattern",
+    "SetValue",
+    "IsInvokePatternAvailable",
+    "IsTogglePatternAvailable",
+    "IsSelectionItemPatternAvailable",
+    "IsExpandCollapsePatternAvailable",
+    "IsValuePatternAvailable",
+    "GetInvokePattern",
+    "GetTogglePattern",
+    "GetSelectionItemPattern",
+    "GetExpandCollapsePattern",
+    "GetValuePattern",
+    "IsInvokePressed",
+    "ToggleState",
+    "IsSelected",
+    "IsExpanded",
+    "CurrentValue",
+    "CurrentIsValuePatternAvailable",
 }
 
 # We DO use these read-only names — confirm they are used, not banned.
@@ -145,6 +169,9 @@ class TestNoActionAPI(unittest.TestCase):
         offenders: list[tuple[str, int, str]] = []
 
         for py in sorted(HERE.glob("*.py")):
+            # actions.py is the designated home for P4 action APIs — skip it.
+            if py.name == "actions.py":
+                continue
             text = py.read_text(encoding="utf-8")
             states = _scan_string_states(text)
             for (lineno, in_string), line in zip(states, text.splitlines()):
