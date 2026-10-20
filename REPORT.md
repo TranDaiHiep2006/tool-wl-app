@@ -1454,3 +1454,243 @@ fbebaa4 docs(p4): fill in commit hash for P4 fix round
 `1dad76a`.
 
 (End of P4 fix round.)
+
+---
+
+## P4 fix round 2 — action plans now survive server restarts
+
+Your manual test found a real-path bug that the E2E structurally could not
+catch: in Cursor, `type_text` Phase 1 returned a plan and Phase 2 with the
+same `plan_id` was refused **4 out of 4 times**, including one attempt a few
+hundred ms after the plan. Your hypothesis — that the two phases hit
+different server processes — is **confirmed**, with evidence below.
+
+### 1. Diagnosis — the log evidence
+
+`logs/actions.log` before the fix. Each `plan` is immediately followed by a
+`refuse`, and every refusal collapsed into one opaque string:
+
+```text
+{"timestamp": "2026-10-20T17:49:17.000Z", "event": "plan",   "tool": "type_text", "process": "notepad.exe", "window_title": "Untitled - Notepad", "control_name": "Text editor", "detail": "method=via keyboard input into the focused control current='' new='Hà Nội những ngày đầu đông, sương mù giăng kín mặt hồ Tây. …"}
+{"timestamp": "2026-10-20T17:50:40.000Z", "event": "refuse", "tool": "type_text", "process": "notepad.exe", "window_title": "Untitled - Notepad", "control_name": "Text editor", "detail": "plan expired, consumed, or text/method mismatch"}
+{"timestamp": "2026-10-20T17:50:48.000Z", "event": "plan",   "tool": "type_text", … }
+{"timestamp": "2026-10-20T17:51:17.000Z", "event": "refuse", … "detail": "plan expired, consumed, or text/method mismatch"}
+{"timestamp": "2026-10-20T17:51:29.000Z", "event": "plan",   … }
+{"timestamp": "2026-10-20T17:51:39.000Z", "event": "refuse", … "detail": "plan expired, consumed, or text/method mismatch"}
+{"timestamp": "2026-10-20T17:55:30.000Z", "event": "plan",   … }
+{"timestamp": "2026-10-20T17:55:37.000Z", "event": "refuse", … "detail": "plan expired, consumed, or text/method mismatch"}
+```
+
+The gaps are 83 s, 29 s, 10 s and **7 s**. Against a 300 s TTL, a 7 s gap
+cannot be expiry. Every one of these lines said "expired, consumed, or
+mismatch" — never "I have never heard of this plan_id" — which is exactly
+what made the bug invisible.
+
+### 2. Reproduction through the real MCP path
+
+I drove the server the way Cursor does: `python -m server.mcp_server`,
+newline-delimited JSON-RPC over stdin/stdout, `initialize` →
+`notifications/initialized` → `tools/call`. Plan on process A, `terminate`
+A, spawn a **fresh** process B, execute with A's `plan_id`:
+
+```text
+[A] Spawning server A…
+  init: protocolVersion='2024-11-05'
+  parsed plan: phase=plan plan_id='8f390494-0316-43' method='keyboard' ttl=300
+  A terminated.
+
+[B] Spawning server B (FRESH process)…
+  init: protocolVersion='2024-11-05'
+  exec response (B, fresh process): {"ok":false,"error":"plan_not_found",
+      "message":"plan_id '8f390494-0316-43' not found or already consumed"}
+
+=== REPRODUCTION RESULT ===
+  error='plan_not_found'
+  -> BUG REPRODUCED: cross-process plan_not_found (server B never saw plan_id)
+```
+
+Process B genuinely had never seen the plan. **Root cause confirmed:**
+
+```text
+# server/actions.py (before)
+_plans: Dict[str, ActionPlan] = {}       # module-level, dies with the process
+```
+
+`ActionPlan` objects, `_store_plan`, `_gc_plans` and `_consume_plan` all
+operated on that dict. The E2E passed because it called plan and execute
+inside one Python process — it could never have found this.
+
+### 3. The fix — stateless HMAC-signed plan tokens
+
+Rather than a JSON plan store, `plan_id` is now **the token**. New module
+`server/action_token.py`:
+
+- **Token format** — `base64url(canonical_json(payload)) . base64url(HMAC-SHA256)`.
+- **Payload** — `{v, plan_id, tool, method, issued_at, ttl, binding}` where
+  `binding` holds `{tool, process, window, hwnd, control_name,
+  control_type, automation_id, args_hash}`.
+- **Per-install secret** — 32 random bytes in
+  `config/.action_token_secret.key`, created on first use, git-ignored, and
+  loaded by every server process. Rotating it invalidates all outstanding
+  plans (which is the correct behaviour).
+- **Cross-process-stable identity** — the binding uses only values that mean
+  the same thing in another process: process name, the **resolved** window
+  title (not the fuzzy user-supplied substring), the native `hwnd`, control
+  name, `automation_id`, control type, and a SHA-256 of the action args.
+  No Python object identity, no UIA runtime ids.
+- **Atomic single-use** — `os.open(path, O_CREAT|O_EXCL)` against
+  `data/plans/consumed/<plan_id>.flag`. First writer wins; a second process
+  gets `EEXIST`. If the filesystem misbehaves the code refuses rather than
+  risking a double execution.
+
+### 4. Refusals are now specific, and the received `plan_id` is logged
+
+The single opaque `plan_invalid` is gone. `verify_token` returns one of:
+
+| Reason | Meaning |
+| ------ | ------- |
+| `MALFORMED` | not a token (empty, no `.` separator, bad base64) |
+| `UNKNOWN` | unparseable payload, or wrong schema version |
+| `SIGNATURE` | HMAC mismatch — tampered, or signed by a different install |
+| `EXPIRED` | `now - issued_at > ttl` |
+| `CONSUME_RACE` | consumed flag already exists — replay |
+| `BINDING_MISMATCH` | tool / window / control / automation_id / args hash differ |
+| `plan_method_changed` | the control's UIA pattern set changed between plan and execute |
+
+Real lines from `logs/actions.log` after the fix, one per refusal class:
+
+```text
+{"event": "plan",   "detail": "… plan_id=ts-1792522056-e63916fd67 current='' new='cproc-1792522022-520dd8'"}
+{"event": "refuse", "detail": "token=UNKNOWN: json decode failed: Expecting ',' delimiter: line 1 column 382 (char 381)"}
+{"event": "refuse", "detail": "token=MALFORMED: b64 decode failed: Invalid base64-encoded string: number of data characters (5) cannot be 1 more than a multiple of 4"}
+{"event": "refuse", "detail": "token=CONSUME_RACE: token has already been consumed"}
+{"event": "refuse", "detail": "token=BINDING_MISMATCH: token binding does not match execute call: token={'args_hash': '4491f54…', 'control_name': 'Text editor', 'control_type': 'DocumentControl', 'hwnd': 23726988, 'process': 'notepad.exe', 'tool': 'type_text', 'window': '*cross-proc-probecross-proc-okcross- - Notepad'}, execute={'tool': 'type_text', 'window': '…', 'control_name': 'Text editor', 'automation_id': '', 'args_hash': '1c396b093a935929e4351086e1abf830'}"}
+```
+
+The last one is the money shot: it names **both** bindings side by side, so
+you can see at a glance that `args_hash` differs — `bound-text` vs
+`swapped-text` — with no ambiguity about which field failed.
+
+All four original gate rules are untouched and still run in **both** phases:
+`STOP_ACTIONS`, `enabled`, `allowed_processes`, `deny_labels`. The gate code
+is unchanged; only the plan plumbing was replaced.
+
+### 5. Verification through the real MCP path (not in-process)
+
+`tests/cross_process_verify.py` — every check spawns a real
+`python -m server.mcp_server` and speaks JSON-RPC to it. No in-process
+simulation anywhere in this suite. Notepad was restarted and driven
+physically:
+
+```text
+======================================================================
+P4 cross-process plan verification (real MCP stdio path)
+======================================================================
+Notepad window: '*cross-proc-probe - Notepad'
+
+(a) cross-process: plan on A, execute on fresh B
+      plan issued on A (pid 33080), token eyJiaW5kaW5nIjp7ImYyMDQx…
+      executing on FRESH process B (pid 23808)
+  [PASS] (a) cross-process plan->execute -- phase=execute method=keyboard chars=23
+  [PASS] (a) physical proof: chars_typed > 0 -- server B returned chars_typed=23 (text sent via SendInput)
+  [PASS] (b) same-process plan->execute -- phase=execute chars=12
+  [PASS] (c1) tampered token refused -- error=UNKNOWN
+  [PASS] (c2) unknown/forged token refused -- error=MALFORMED
+  [PASS] (c3) first use across process succeeds -- phase=execute
+  [PASS] (c4) reuse of the same token refused -- error=CONSUME_RACE
+  [PASS] (c5) wrong text on valid token refused -- error=BINDING_MISMATCH
+
+RESULT: 8/8 checks passed
+======================================================================
+```
+
+Requirement-by-requirement:
+
+| Requirement | Status | Evidence |
+| ----------- | ------ | -------- |
+| (a) plan via process A, execute via **fresh** process B must succeed and act on Notepad | **PASS** | different PIDs (`33080` vs `23808`), A terminated in between; `phase=execute`, `chars_typed=23` via `SendInput` |
+| (b) same-process flow still works | **PASS** | `phase=execute chars=12` |
+| (c) tampered refused, specific reason | **PASS** | `error=UNKNOWN` (payload bytes no longer decode) |
+| (c) unknown/forged refused, specific reason | **PASS** | `error=MALFORMED` |
+| (c) reused refused, specific reason | **PASS** | `error=CONSUME_RACE`, across three separate processes |
+| (c) wrong text on a valid token refused | **PASS** | `error=BINDING_MISMATCH` |
+
+Note on (c1): my tamper helper edits the **last two base64url characters of
+the payload**, which corrupts the JSON rather than the signature, so the
+verifier reports `UNKNOWN` (decode failure) rather than `SIGNATURE`. Both
+are refusals; `SIGNATURE` is covered by a dedicated unit test
+(`test_plan_tampered_by_interceptor_refused`) that re-encodes a modified
+payload while keeping the original signature.
+
+### 6. Tests
+
+New `tests/test_action_token.py` (14 tests): round-trip, and one per refusal
+bucket — `MALFORMED`, `UNKNOWN`, `SIGNATURE`, `EXPIRED`, `CONSUME_RACE`,
+`BINDING_MISMATCH` (tool and text), `METHOD_MISMATCH` — plus a
+`TestCrossProcessSimulation` class that mimics the A/B split by sharing the
+secret and the on-disk consumed directory.
+
+`tests/test_actions_gate.py` was updated for the token API: the three tests
+that previously poked `_plans` now assert the specific refusal reason, and
+both fixtures redirect the token module's `SECRET_FILE` and `CONSUMED_DIR`
+into the test's temp dir so tests stay hermetic.
+
+```text
+$ .\.venv\Scripts\python.exe -m pytest -q
+........................................................................ [ 56%]
+..............................................s.........                 [100%]
+127 passed, 1 skipped in 24.56s
+```
+
+The one skip is the pre-existing flaky-desktop foreground test.
+
+### 7. Changes by file
+
+- `server/action_token.py` — **new**. Token issue/decode/verify, per-install
+  secret with atomic create, atomic consumed-marker set, refusal taxonomy.
+- `server/actions.py` — `ActionPlan`, `_plans`, `_store_plan`, `_consume_plan`
+  and `_gc_plans` deleted. Both `click_control` and `type_text` now issue a
+  token at PLAN and verify it at EXECUTE; both bind on the resolved window
+  title. Added `_build_binding` / `_jval` helpers so a control attribute that
+  is not a JSON scalar cannot break token creation.
+- `tests/test_action_token.py` — **new**, 14 tests.
+- `tests/cross_process_verify.py` — **new**, the real-MCP A/B verification.
+- `tests/test_actions_gate.py` — migrated to the token API.
+- `.gitignore` — excludes `config/.action_token_secret.key` and `data/plans/`
+  (per-install state; the secret must never be committed or a plan is
+  forgeable).
+
+`config/actions.json` is unchanged. `extension/background.js` is unchanged.
+No action API symbol moved out of `server/actions.py`; the static scan
+(`tests/test_no_action_api.py`) still passes.
+
+### 8. What you should do now
+
+1. **Restart Cursor** so it respawns the MCP server — the old server
+   process still holds the old `_plans`-based code in memory.
+2. Retry the exact sequence that failed. Phase 1 now returns a long
+   `plan_id` that is a signed token (it will look like
+   `eyJiaW5kaW5nIjp7…`), not a short UUID. **Pass it back verbatim** — do
+   not trim it.
+3. If it still refuses, the log line will now name the exact reason, e.g.
+   `token=BINDING_MISMATCH: … token={…}, execute={…}`. That line tells you
+   which field diverged without any guesswork.
+
+One caveat worth knowing: the token binds the **resolved window title**. If
+you retype into a window whose title changes between the two phases (for
+example Notepad's `*` dirty marker appearing once you start typing), the
+title differs and you get `BINDING_MISMATCH`. That is the gate working as
+designed — but if you hit it in normal use, tell me and I will switch the
+binding to a title-independent identity.
+
+### 9. Commit hash
+
+```text
+$ git log --oneline -2 origin/main
+552ddb1 P4 fix round 2: make action plans survive server restarts via signed tokens
+6107fe5 (previous)
+```
+
+**`552ddb1`**, pushed to `main`.
+
+(End of P4 fix round 2.)
