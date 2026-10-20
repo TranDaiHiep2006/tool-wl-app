@@ -1,13 +1,10 @@
 # tool-wl-app
 
-A **read-only** Model Context Protocol (MCP) server that gives the Cursor Agent
-"eyes" on a Windows desktop. P1 covered observation only. P2 added deep browser
-DOM reading via a small MV3 extension. P3 added Office document reading
-(Word / Excel / PowerPoint, attach-only via COM) and a token-locked
-loopback WebSocket bridge.
+A Model Context Protocol (MCP) server for Windows desktop. P1-P3 are
+strictly read-only. P4 adds action tools behind a strict safety gate.
 
-> Status: **P1 + P2 + P3** (all read-only). No tool in this server mutates the
-> desktop or its documents.
+> Status: **P1 + P2 + P3 + P4** (read-only tools + action tools with safety gate).
+> All mutating tools require a plan+confirm cycle before executing.
 
 ---
 
@@ -32,9 +29,63 @@ Agent, Claude Desktop, etc.):
 | 12 | **`read_word_text`**          | **P3 — full body text of the active Word document (≤ 60 000 chars).**      |
 | 13 | **`read_excel_values`**       | **P3 — values of the active workbook's named sheet (≤ 200×50 cells).**     |
 | 14 | **`read_powerpoint_text`**    | **P3 — per-slide text of the active presentation (≤ 100 slides).**         |
+| 15 | **`click_control`**           | **P4 — click a control via UIA pattern (requires plan+confirm).**        |
+| 16 | **`type_text`**               | **P4 — set editable control text via ValuePattern (requires plan+confirm).** |
+| 17 | **`focus_window`**            | **P4 — bring an allowlisted app to foreground (gate + logging).**        |
 
 All tools return English errors on failure. A bad call on one tool never
 crashes the server.
+
+## P4 — Action tools with safety gate
+
+Three tools let the agent ACT on the desktop, not just observe it.
+Every mutating tool uses a **two-phase plan/confirm cycle**:
+
+**Phase 1** (no `plan_id`): the tool validates the target and returns a
+human-readable plan. Show this to the user and wait for their approval.
+
+**Phase 2** (with `plan_id`): the server verifies the plan is valid,
+unexpired, and matches the action, then executes it once and consumes the
+plan.
+
+### Safety gate
+
+Every action is gated by `config/actions.json`:
+- `enabled: true` must be set.
+- The target window's process must be in `allowed_processes` (default:
+  `["notepad.exe"]`).
+- A `config/STOP_ACTIONS` file blocks all actions instantly.
+- A control whose Name contains a `deny_labels` entry is blocked.
+
+Edit `config/actions.json` to allow your apps:
+
+```jsonc
+{
+  "enabled": true,
+  "allowed_processes": ["notepad.exe", "calc.exe"],
+  "deny_labels": ["delete", "format", "uninstall", "shut down", "pay now", "remove account"]
+}
+```
+
+Every plan, execute, and refusal is logged to `logs/actions.log`
+(gitignored).
+
+### Tools
+
+| Tool | Description |
+| ---- | ----------- |
+| `click_control(window, automation_id?, name?)` | Click a button/menu via UIA pattern (Invoke > Toggle > SelectionItem > ExpandCollapse). Phase 1 returns a plan. |
+| `type_text(window, text, automation_id?, name?)` | Set an editable control's text via ValuePattern.SetValue. Phase 1 returns a plan showing current and new text. |
+| `focus_window(window)` | Bring an allowlisted window to foreground. No plan needed; returns honest error if Windows refuses. |
+
+### Read-only by design
+
+P1-P3 tools remain strictly read-only. The static scan in
+`tests/test_no_action_api.py` forbids all action APIs (`Invoke`,
+`SetValue`, `SendInput`, `SetForegroundWindow`, etc.) everywhere in
+`server/` except `actions.py`.
+
+---
 
 ## P2 — deep browser reading
 
@@ -213,7 +264,7 @@ Add an entry for this server. The full file should look like:
 }
 ```
 
-Then **restart Cursor**. In the chat, the 15 tools will appear under the
+Then **restart Cursor**. In the chat, the 18 tools will appear under the
 `tool-wl-app` MCP server name.
 
 > If Cursor does not see the change, fully close and reopen it (the
@@ -236,6 +287,9 @@ When you need screen information, follow this order to save quota:
    what you see.
 8. `find_text_on_screen` — locate text by visible string.
 9. `screenshot` — **last resort**. Never in a loop.
+10. **`click_control` / `type_text`** — only after the user has approved
+    the plan. Show the plan description to the user first.
+11. **`focus_window`** — only for allowlisted apps; confirm with user first.
 
 ## Tests
 
@@ -243,11 +297,18 @@ When you need screen information, follow this order to save quota:
 .\.venv\Scripts\python.exe -m pytest tests -v
 ```
 
-85 tests covering per-tool functional, no-action-API static scan,
+106 tests covering per-tool functional, no-action-API static scan,
 native messaging framing, end-to-end WebSocket round-trip, per-install
-token auth, Office COM mock coverage, and quota budgets.
+token auth, Office COM mock coverage, P4 safety gate unit tests, and
+quota budgets.
 
-## Read-only by design
+Run the P4 manual E2E (requires real desktop):
+
+```powershell
+.\.venv\Scripts\python.exe tests\manual_actions_e2e.py
+```
+
+## Read-only by design (P1-P3) + Action safety gate (P4)
 
 P1 + P2 + P3 ship **only** read-only capabilities. No tool can click, type,
 focus a window, move the cursor, launch programs, save Office documents,

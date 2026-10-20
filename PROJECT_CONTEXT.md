@@ -1,24 +1,17 @@
 # PROJECT_CONTEXT
 
-Architecture and conventions for `tool-wl-app` (P1 + P2 + P3, read-only MCP server).
+Architecture and conventions for `tool-wl-app` (P1 + P2 + P3 + P4).
 
 ## 1. Goals (long-term)
 
 Cursor Agent can **see** a Windows desktop — open apps, document structure,
 the active browser tab, the actual DOM of the active web page, and the
-CONTENTS of open Office files (Word / Excel / PowerPoint) — and use
-that information to guide a human user step by step through operations
-they perform manually.
+CONTENTS of open Office files (Word / Excel / PowerPoint) — and **ACT
+on the desktop** (click, type, focus windows) within a strict safety gate,
+guiding a human user step by step through operations they perform manually.
 
-P1 is observation only via UIA, screenshots, OCR, clipboard, and the
-browser address bar. P2 adds **deep browser reading** — a small MV3
-extension + native messaging host that lets the agent read the active
-page's DOM (text + pruned interactive structure). P3 adds **Office
-document content** via pywin32 COM (read-only) and **locks down the
-WebSocket bridge** with a per-install secret token. Everything remains
-strictly read-only.
-
-Action upgrades (click, type, focus, run shell commands) belong to P4.
+P1-P3 are strictly read-only. P4 adds three action tools behind a
+two-phase plan/execute safety gate.
 
 ## 2. Tech stack
 
@@ -40,13 +33,16 @@ mouse, type, or click.
 ```
 server/
 ├── __init__.py
-├── mcp_server.py     # FastMCP registration of 15 tools (9 P1 + 2 P2 + 3 P3)
+├── mcp_server.py     # FastMCP registration of 18 tools (9 P1 + 2 P2 + 3 P3 + 3 P4)
 ├── ui_automation.py  # window list, foreground, UIA tree, control text
 ├── screenshots.py    # mss + JPEG resize helpers
 ├── ocr.py            # Windows.Media.Ocr (runs on a dedicated MTA thread)
 ├── browser.py        # read active tab info from chrome/edge/firefox (address bar)
 ├── browser_dom.py    # P2: get_page_text / get_page_structure via WS bridge
-└── clipboard.py      # read clipboard text or detect non-text formats
+├── clipboard.py      # read clipboard text or detect non-text formats
+├── bridge_auth.py    # P3: per-install token for browser bridge
+├── office_com.py     # P3: Office COM read-only tools
+└── actions.py        # P4: click_control, type_text, focus_window + safety gate
 
 native_host/
 ├── __init__.py
@@ -68,15 +64,17 @@ tests/
 ├── measure_browser_dom.py      # P2: measure get_page_text / get_page_structure on real pages
 ├── edge_e2e.py                 # P2: launch Edge with extension, exercise get_page_text on real pages
 ├── edge_e2e_structure.py       # P2: same for get_page_structure
-├── test_no_action_api.py       # static scan: zero action APIs in server/
-├── test_ui_automation.py       # list_windows / foreground / ui_tree / control_text + hermetic mock variants
-├── test_screenshots.py         # screenshot size and shape constraints
-├── test_ocr.py                 # synthetic image OCR + truncation
-├── test_clipboard_browser.py   # clipboard + get_browser_tab_info
-├── test_mcp_registration.py    # all 12 tools are registered
-├── test_browser_dom.py         # P2: caps, framing, WS round-trip, timeout envelope
+├── test_no_action_api.py        # static scan: zero action APIs except in actions.py
+├── test_actions_gate.py         # P4: 20 gate unit tests (hermetic mocks)
+├── test_ui_automation.py        # list_windows / foreground / ui_tree / control_text + hermetic mock variants
+├── test_screenshots.py          # screenshot size and shape constraints
+├── test_ocr.py                # synthetic image OCR + truncation
+├── test_clipboard_browser.py    # clipboard + get_browser_tab_info
+├── test_mcp_registration.py     # all 18 tools are registered
+├── test_browser_dom.py          # P2: caps, framing, WS round-trip, timeout envelope
+├── test_office_com.py           # P3: Office COM mock coverage + no-mutating-API checks
 ├── test_quota.py               # per-tool envelope size budgets
-└── test_*.py                   # (raw_smoke.py removed; see REPORT.md §6)
+└── manual_actions_e2e.py      # P4: Notepad E2E (NOT in pytest; run manually)
 ```
 
 ## 4. Conventions
@@ -163,19 +161,92 @@ If no supported browser is open, `get_browser_tab_info()` returns
   warning — run the MCP server once, then **reload the extension**
   (the SW caches dynamic imports).
 
-## 7. P4 direction (NOT done yet; future)
+## 7. P4 — DELIVERED
 
-P3 (Office COM + bridge lockdown) is delivered (see §7b above). What
-remains for a future P4:
+### 7.1 Safety gate design
 
-1. **Action tools** — `click(x,y)`, `set_focus_window(hwnd)`,
-   `type_text(text)`, `hotkey(combo)`, `wait_for_window(title, timeout)`.
-   Each gated behind an explicit user approval flow because the spec says
-   "I will not buy ChatGPT or other bots" — every dangerous call must be
-   deliberate.
-2. **Multi-monitor coordinate model.** Right now
-   `screenshot(mode="screen")` always captures monitor 1. Add `monitor`
-   argument so the agent can pick.
+Every mutating action (`click_control`, `type_text`) is two-phase:
+
+**Phase 1 — PLAN** (no `plan_id`): validates the target control,
+checks all gate rules, and returns a plan `{plan_id, description,
+expires_in_s: 300}`. The `description` is a human-readable sentence
+stating exactly what will happen (window title, control name, action;
+for `type_text` it also shows the current value and new text,
+truncated to 200 chars). **Nothing is executed in Phase 1.**
+
+**Phase 2 — EXECUTE** (with `plan_id` from Phase 1): re-checks all gate
+rules, verifies the plan exists and is unexpired (300 s) and unused, then
+performs the action and consumes the plan (single-use). Any mismatch →
+structured error, no action.
+
+`focus_window` has no plan phase, but the same allowlist + STOP check
+applies.
+
+**Gate rules checked in BOTH phases:**
+1. `config/actions.json`: `enabled=true` AND target window's process in
+   `allowed_processes`.
+2. `config/STOP_ACTIONS` exists → refuse everything.
+3. Target control's `Name` contains any `deny_labels` entry (case-insensitive).
+4. Log every plan, execute, and refusal as one JSON line to
+   `logs/actions.log` (created automatically, gitignored).
+
+**Config file** (`config/actions.json`, created with defaults on first run):
+```json
+{
+  "enabled": true,
+  "allowed_processes": ["notepad.exe"],
+  "deny_labels": ["delete", "format", "uninstall", "shut down", "pay now", "remove account"]
+}
+```
+
+### 7.2 Three action tools — `server/actions.py`
+
+| Tool | What it does |
+| ---- | ------------ |
+| `click_control(window, automation_id?, name?, plan_id?)` | Invoke / Toggle / SelectionItem / ExpandCollapse on a control; reports which pattern was used. Phase 1 returns a plan. |
+| `type_text(window, text, automation_id?, name?, plan_id?)` | Set an editable control's text via `ValuePattern.SetValue`. Phase 1 returns a plan with current + new text. |
+| `focus_window(window)` | Bring an allowlisted app's window to foreground via `SetForegroundWindow`. No plan. Returns honest error if Windows refuses foreground. |
+
+**Targeting:** window by hwnd or title; control by `automation_id` and/or
+exact `Name`. Resolution must yield **exactly one** control (0 or 2+ = error).
+
+**Pattern priority for click:** `Invoke > Toggle > SelectionItem >
+ExpandCollapse`. No coordinate clicking; no `SendInput`.
+
+**Static scan:** `test_no_action_api.py` forbids all action APIs
+(`Invoke`, `SetValue`, `SetForegroundWindow`, etc.) in ALL
+`server/*.py` EXCEPT `actions.py`.
+
+### 7.3 Tests
+
+- **Gate unit tests** (`tests/test_actions_gate.py`): 20 hermetic mock
+  tests covering every gate rule (execute without plan → plan returned,
+  expired plan → refused, consumed plan → refused, different text →
+  refused, non-allowlisted → refused, STOP_ACTIONS → refused,
+  deny-label → refused, enabled=false → refused, focus_window gate
+  refusals, SetForegroundWindow failure, plan/execute/refusal logging).
+- **E2E** (`tests/manual_actions_e2e.py`): launches Notepad with a
+  temp config, exercises plan+execute plan for `type_text`, reads back
+  via `get_control_text`, tests `click_control` on menu items, and
+  demonstrates a real gate refusal for a non-allowlisted process.
+  Not part of pytest (touches real desktop).
+
+### 7.4 How the user edits the allowlist
+
+Edit `config/actions.json` directly:
+
+```jsonc
+{
+  "enabled": true,
+  "allowed_processes": ["notepad.exe", "calc.exe", "YourApp.exe"],
+  "deny_labels": ["delete", "format", "uninstall"]
+}
+```
+
+To block all actions immediately, create an empty file named
+`config/STOP_ACTIONS` (no content needed). Remove it to restore access.
+
+## 8. Proposed P5 content
 
 ## 7b. P3 — DELIVERED
 
@@ -252,5 +323,5 @@ Tests in `tests/test_browser_dom.py::TestBridgeAuth` cover:
 
 ## 10. References
 
-- Prompt: `prompt.md` (P1 + P2 brief).
+- Prompt: `prompt.md` (P1 + P2 + P3 + P4 brief).
 - Repo: https://github.com/TranDaiHiep2006/tool-wl-app
