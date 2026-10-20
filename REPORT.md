@@ -1438,10 +1438,12 @@ no top-level window claiming foreground (see commit message below).
 
 ### 9. Commit hash
 
-The P4 fix-round commit is **`3ab414e`** (HEAD of `origin/main`):
+The P4 fix-round commit is **`3ab414e`** (the doc fill-in for the
+hash landed as a separate doc-only commit `fbebaa4`):
 
 ```
-$ git log --oneline -3 origin/main
+$ git log --oneline -4 origin/main
+fbebaa4 docs(p4): fill in commit hash for P4 fix round
 3ab414e fix(p4): send-input fallbacks under the same gate, real E2E proof
 28ddd32 docs: add P4 REPORT
 6eb4e5a docs: update PROJECT_CONTEXT.md and README.md for P4
