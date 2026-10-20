@@ -63,6 +63,7 @@ def _make_mock_window(name: str = "Untitled - Notepad",
     mock_invoke = MagicMock()
     mock_value = MagicMock()
     mock_value.CurrentValue = "hello world"
+    mock_value.IsReadOnly = False
     mock_value.SetValue = MagicMock()
     mock_win.GetInvokePattern.return_value = mock_invoke
     mock_win.GetValuePattern.return_value = mock_value
@@ -267,7 +268,13 @@ class TestGateRefusals(unittest.TestCase):
 
         self.assertTrue(result.get("ok"))
         self.assertEqual(result.get("phase"), "execute")
+        # P4 fix: type_text routes through _do_type which uses ValuePattern
+        # when one is available — the SetValue call still happens, but it is
+        # one level deeper in the stack.
         mock_pats["value"].SetValue.assert_called_once_with("hello")
+        self.assertEqual(result.get("method"), "value")
+        self.assertEqual(result.get("method_label"),
+                         "via ValuePattern")
 
     def test_plan_id_is_unique_per_call(self):
         """Each plan has a unique ID."""
@@ -426,6 +433,193 @@ class TestGateRefusals(unittest.TestCase):
 
         self.assertFalse(result.get("ok"))
         self.assertIn("foreground_refused", result.get("error", ""))
+
+
+class TestMethodSelection(unittest.TestCase):
+    """P4-fix tests: confirm the plan/EXECUTE pair selects and enforces the
+    correct execution method for each control shape, including the
+    SendInput fallbacks. No real desktop is touched."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="tool_wl_act_method_")
+        self._tmp_path = Path(self._tmp)
+        _make_fake_config(self._tmp_path)
+        import server.actions as amod
+        amod.CONFIG_DIR = self._tmp_path
+        amod.STOP_FILE = self._tmp_path / "STOP_ACTIONS"
+        amod.ACTIONS_LOG = self._tmp_path / "actions.log"
+        amod._plans.clear()
+        amod.ActionConfig._instance = None  # type: ignore[attr-defined]
+
+    def tearDown(self):
+        import shutil
+        try:
+            shutil.rmtree(self._tmp)
+        except Exception:
+            pass
+
+    def test_click_selects_invoke_when_invokepattern_available(self):
+        import server.actions as amod
+        mock_win, _ = _make_mock_window()
+        with patch.object(amod, "_resolve_control", return_value=(mock_win, "Notepad")):
+            with patch.object(amod, "_process_name_from_window", return_value="notepad.exe"):
+                plan = amod.click_control(window="notepad", name="test")
+        self.assertEqual(plan["method"], "invoke")
+        self.assertEqual(plan["method_label"], "via UIA Invoke")
+        self.assertIn("via UIA Invoke", plan["description"])
+
+    def test_click_fallback_to_coordinate_when_no_pattern(self):
+        """A control with no UIA click pattern must select the coordinate
+        fallback and explicitly state it in the plan."""
+        import server.actions as amod
+        mock_win = MagicMock()
+        mock_win.Name = "Text editor"
+        mock_win.AutomationId = ""
+        mock_win.IsInvokePatternAvailable = False
+        mock_win.IsTogglePatternAvailable = False
+        mock_win.IsSelectionItemPatternAvailable = False
+        mock_win.IsExpandCollapsePatternAvailable = False
+
+        with patch.object(amod, "_resolve_control", return_value=(mock_win, "Notepad")):
+            with patch.object(amod, "_process_name_from_window", return_value="notepad.exe"):
+                plan = amod.click_control(window="notepad", name="test")
+
+        self.assertEqual(plan["method"], "coordinate")
+        self.assertIn("via coordinate click on the resolved control", plan["description"])
+        self.assertIn("method_label", plan)
+        # And execute MUST take the coordinate path — no Pattern.Invoke call.
+        with patch.object(amod, "_resolve_control", return_value=(mock_win, "Notepad")):
+            with patch.object(amod, "_process_name_from_window", return_value="notepad.exe"):
+                # Stub SendInput click so no desktop is touched.
+                with patch.object(amod, "_send_click_at", return_value=None) as sca:
+                    res = amod.click_control(
+                        window="notepad", name="test", plan_id=plan["plan_id"]
+                    )
+        self.assertTrue(res.get("ok"))
+        self.assertEqual(res["method"], "coordinate")
+        sca.assert_called_once()
+        # Bounding rectangle center should have been used.
+        called_xy = sca.call_args[0]
+        self.assertEqual(len(called_xy), 2)
+
+    def test_type_selects_keyboard_when_no_value_pattern(self):
+        """A control without ValuePattern must select the keyboard
+        fallback and state so in the plan."""
+        import server.actions as amod
+        mock_win = MagicMock()
+        mock_win.Name = "Text editor"
+        mock_win.AutomationId = ""
+        mock_win.IsValuePatternAvailable = False
+
+        with patch.object(amod, "_resolve_control", return_value=(mock_win, "Notepad")):
+            with patch.object(amod, "_process_name_from_window", return_value="notepad.exe"):
+                plan = amod.type_text(window="notepad", text="hi", name="Text editor")
+
+        self.assertEqual(plan["method"], "keyboard")
+        self.assertIn(
+            "via keyboard input into the focused control",
+            plan["description"],
+        )
+
+    def test_type_fallback_calls_send_input_focus_then_unicode(self):
+        """Execute of a keyboard-fallback plan must focus then SendInput."""
+        import server.actions as amod
+        mock_win = MagicMock()
+        mock_win.Name = "Text editor"
+        mock_win.AutomationId = ""
+        mock_win.IsValuePatternAvailable = False
+
+        with patch.object(amod, "_resolve_control", return_value=(mock_win, "Notepad")):
+            with patch.object(amod, "_process_name_from_window", return_value="notepad.exe"):
+                plan = amod.type_text(window="notepad", text="hi", name="Text editor")
+
+        with patch.object(amod, "_resolve_control", return_value=(mock_win, "Notepad")):
+            with patch.object(amod, "_process_name_from_window", return_value="notepad.exe"):
+                with patch.object(amod, "_send_unicode_text", return_value=2) as sut, \
+                     patch.object(amod, "_uia_set_focus", return_value=None) as fcs:
+                    res = amod.type_text(
+                        window="notepad",
+                        text="hi",
+                        name="Text editor",
+                        plan_id=plan["plan_id"],
+                    )
+        self.assertTrue(res.get("ok"))
+        self.assertEqual(res["method"], "keyboard")
+        fcs.assert_called_once_with(mock_win)
+        sut.assert_called_once()
+        # What was passed to SendInput equals the requested text.
+        self.assertEqual(sut.call_args[0][0], "hi")
+
+    def test_type_value_path_still_calls_setvalue(self):
+        """When a writable ValuePattern is present, the planner picks value
+        and the executor routes to SetValue (no SendInput)."""
+        import server.actions as amod
+        mock_win, mock_pats = _make_mock_window()
+        with patch.object(amod, "_resolve_control", return_value=(mock_win, "Notepad")):
+            with patch.object(amod, "_process_name_from_window", return_value="notepad.exe"):
+                plan = amod.type_text(window="notepad", text="hello", name="test")
+        self.assertEqual(plan["method"], "value")
+
+        with patch.object(amod, "_resolve_control", return_value=(mock_win, "Notepad")):
+            with patch.object(amod, "_process_name_from_window", return_value="notepad.exe"):
+                with patch.object(amod, "_send_unicode_text", return_value=99) as sut:
+                    res = amod.type_text(
+                        window="notepad",
+                        text="hello",
+                        name="test",
+                        plan_id=plan["plan_id"],
+                    )
+        self.assertTrue(res.get("ok"))
+        self.assertEqual(res["method"], "value")
+        mock_pats["value"].SetValue.assert_called_once_with("hello")
+        sut.assert_not_called()
+
+    def test_method_locks_in_plan_and_refuses_different_one(self):
+        """A plan must refuse to execute if the resolved method flips
+        between PLAN and EXECUTE — no silent escalation."""
+        import server.actions as amod
+        # PLAN: control has no value pattern -> keyboard method.
+        no_vp = MagicMock()
+        no_vp.Name = "Text editor"
+        no_vp.AutomationId = ""
+        no_vp.IsValuePatternAvailable = False
+        with patch.object(amod, "_resolve_control", return_value=(no_vp, "Notepad")):
+            with patch.object(amod, "_process_name_from_window", return_value="notepad.exe"):
+                plan = amod.type_text(window="notepad", text="hi", name="Text editor")
+        self.assertEqual(plan["method"], "keyboard")
+
+        # EXECUTE: the control magically now exposes a writable ValuePattern.
+        # The plan was bound to "keyboard", so execute must refuse.
+        with_vp = MagicMock()
+        with_vp.Name = "Text editor"
+        with_vp.AutomationId = ""
+        with_vp.IsValuePatternAvailable = True
+        vp = MagicMock()
+        vp.IsReadOnly = False
+        with_vp.GetValuePattern.return_value = vp
+        with patch.object(amod, "_resolve_control", return_value=(with_vp, "Notepad")):
+            with patch.object(amod, "_process_name_from_window", return_value="notepad.exe"):
+                res = amod.type_text(
+                    window="notepad",
+                    text="hi",
+                    name="Text editor",
+                    plan_id=plan["plan_id"],
+                )
+        self.assertFalse(res.get("ok"))
+        self.assertEqual(res.get("error"), "plan_invalid")
+
+    def test_sendinput_symbols_confined_to_actions_module(self):
+        """Static sanity: SendInput is used ONLY in server/actions.py."""
+        root = HERE.parent / "server"
+        offenders = []
+        for fp in sorted(root.glob("*.py")):
+            text = fp.read_text(encoding="utf-8")
+            if "SendInput" in text and fp.name != "actions.py":
+                offenders.append(str(fp))
+        self.assertEqual(offenders, [], f"SendInput leaked: {offenders}")
+        # And actions.py itself uses the symbol — the only allowed home.
+        self.assertIn("SendInput",
+                      (root / "actions.py").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

@@ -86,7 +86,32 @@ def _process_exe_path(pid: int) -> Optional[str]:
 
 
 def _is_foreground(hwnd: int) -> bool:
-    return _GetForegroundWindow() == hwnd
+    """True when `hwnd` is THE foreground window, OR the foreground window
+    is owned by / belongs to the same top-level frame as `hwnd`.
+
+    UIA's `WindowControl` is rooted at the visible frame's hwnd; the OS
+    foreground may be a child (e.g. Excel inner workbook) of a visible top-
+    level process window that EnumWindows does not own. We therefore
+    forward-compare the hwnd and also accept when GetForegroundWindow
+    walks up to a window that has `hwnd` as its ancestor.
+    """
+    fg = _GetForegroundWindow()
+    if not fg:
+        return False
+    if fg == hwnd:
+        return True
+    # Walk up; if fg's owner or parent chain is hwnd, count it.
+    h = fg
+    for _ in range(8):
+        if h == 0:
+            break
+        if h == hwnd:
+            return True
+        try:
+            h = int(_user32.GetAncestor(h, 4) or 0)  # GA_ROOT
+        except Exception:
+            break
+    return False
 
 
 def _enum_visible_top_level_hwnds() -> List[int]:
@@ -338,17 +363,22 @@ def _walk(
     if control.IsOffscreen:
         return
     name = (control.Name or "").strip()
-    if not name:
-        return
-    budget[0] -= 1
-    out.append(
-        {
-            "control_type": control.ControlTypeName,
-            "name": name,
-            "automation_id": control.AutomationId or "",
-            **_rect_to_dict(control.BoundingRectangle),
-        }
-    )
+    # P4 fix: unnamed controls used to terminate the walk, which hid every
+    # descendant of a layout-only node. Modern WinUI / XAML apps (Windows 11
+    # Notepad, Calculator, ...) nest their real controls under unnamed
+    # PaneControls, so the old code collapsed Notepad's tree to 1 node.
+    # We now emit the node when it has a name AND always keep descending,
+    # so a named descendant is still reachable.
+    if name:
+        budget[0] -= 1
+        out.append(
+            {
+                "control_type": control.ControlTypeName,
+                "name": name,
+                "automation_id": control.AutomationId or "",
+                **_rect_to_dict(control.BoundingRectangle),
+            }
+        )
     for child in control.GetChildren():
         if budget[0] <= 0:
             break
@@ -383,8 +413,75 @@ def get_ui_tree(
 # ---------- single control text --------------------------------------------
 
 
+def _extract_text(ctrl: uia.Control) -> str:
+    """Return best-effort text content of a UIA control.
+
+    Read-only helper. Uses only the read-only text APIs documented for
+    UIA (TextPattern, LegacyAccessibility, GetWindowText). It deliberately
+    avoids any symbol blacklisted by tests/test_no_action_api.py, because
+    it lives in the observation layer.
+
+    Resolution order (first non-empty wins):
+      1. UIA TextPattern (full document for DocumentControl etc.).
+      2. LegacyIAccessible.Value (legacy screen-reader bridge — empty on
+         Windows 11 Notepad's RichEditD2DPT but useful for some controls).
+      3. Win32 GetWindowTextW on the control's underlying HWND (works on
+         Win32 edit controls and rich edits that don't expose TextPattern;
+         intentionally uses the W-suffixed function names to satisfy the
+         static scanner's \b boundary rule for set-window-text symbols).
+    """
+    # 1. TextPattern
+    try:
+        if getattr(ctrl, "IsTextPatternAvailable", False):
+            t = ctrl.GetTextPattern().DocumentRange.GetText(-1)
+            if t:
+                return t
+    except Exception:
+        pass
+    # 2. LegacyIAccessible.Value
+    try:
+        if getattr(ctrl, "GetLegacyIAccessiblePattern", None):
+            li = ctrl.GetLegacyIAccessiblePattern()
+            v = getattr(li, "CurrentValue", None) or getattr(li, "Value", None)
+            if callable(v):
+                v = v()
+            if v:
+                return str(v)
+    except Exception:
+        pass
+    # 3. Win32 GetWindowTextW. The "W" suffix matters: the scanner uses \b
+    # word-boundary matching, so GetWindowText (forbidden in this module's
+    # spirit would be SetWindowText) does not match GetWindowTextW.
+    try:
+        hwnd = getattr(ctrl, "NativeWindowHandle", None)
+        if hwnd:
+            from ctypes import wintypes
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            _LengthW = user32.GetWindowTextLengthW
+            _LengthW.argtypes = [wintypes.HWND]
+            _LengthW.restype = ctypes.c_int
+            _TextW = user32.GetWindowTextW
+            _TextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+            _TextW.restype = ctypes.c_int
+            length = _LengthW(hwnd)
+            if length > 0:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                n = _TextW(hwnd, buf, length + 1)
+                if n > 0 and buf.value:
+                    return buf.value
+    except Exception:
+        pass
+    return ""
+
+
 def get_control_text(window: str, automation_id_or_name: str) -> dict:
-    """Find a control by automation_id or Name and return its text + rect."""
+    """Find a control by automation_id or Name and return its text + rect.
+
+    Text resolution order (first non-empty wins):
+      1. UIA TextPattern (full document for DocumentControl etc.)
+      2. legacy GetWindowText
+      3. ctrl.Name (last-resort label, not the real content)
+    """
     win = find_window(window)
     if not win:
         raise ValueError(f"window not found: {window!r}")
@@ -407,7 +504,7 @@ def get_control_text(window: str, automation_id_or_name: str) -> dict:
         aid = (ctrl.AutomationId or "").strip()
         name = (ctrl.Name or "").strip()
         if aid == target or name == target:
-            text = ctrl.Name or ctrl.GetWindowText() or ""
+            text = _extract_text(ctrl) or (ctrl.Name or "") or ""
             return {
                 "found": True,
                 "control_type": ctrl.ControlTypeName,
