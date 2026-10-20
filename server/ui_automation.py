@@ -35,6 +35,30 @@ _kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
 _psapi = ctypes.WinDLL("Psapi.dll", use_last_error=True)
 
 
+# --- additional Win32 helpers used by the corrected enumeration -----------
+
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
+_EnumWindows = _user32.EnumWindows
+_EnumWindows.argtypes = [ctypes.c_void_p, wintypes.LPARAM]
+_EnumWindows.restype = wintypes.BOOL
+_IsWindowVisible = _user32.IsWindowVisible
+_IsWindowVisible.argtypes = [wintypes.HWND]
+_IsWindowVisible.restype = wintypes.BOOL
+_GetWindowLongPtrW = _user32.GetWindowLongPtrW
+_GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+_GetWindowLongPtrW.restype = ctypes.c_longlong
+_GetClassNameW = _user32.GetClassNameW
+_GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+_GetClassNameW.restype = ctypes.c_int
+_GetForegroundWindow = _user32.GetForegroundWindow
+_GetForegroundWindow.argtypes = []
+_GetForegroundWindow.restype = wintypes.HWND
+
+# Win32 style bits we filter on.
+GWL_STYLE = -16
+WS_VISIBLE = 0x10000000
+
+
 def _process_exe_path(pid: int) -> Optional[str]:
     """Return the full executable path for a PID using QueryFullProcessImageNameW."""
     if pid <= 0:
@@ -62,50 +86,150 @@ def _process_exe_path(pid: int) -> Optional[str]:
 
 
 def _is_foreground(hwnd: int) -> bool:
-    return ctypes.windll.user32.GetForegroundWindow() == hwnd
+    return _GetForegroundWindow() == hwnd
+
+
+def _enum_visible_top_level_hwnds() -> List[int]:
+    """Enumerate truly-visible top-level HWNDs via raw Win32 EnumWindows.
+
+    Returns every hwnd that Win32's own IsWindowVisible says is user-visible:
+    ``IsWindowVisible(hwnd) AND (WS_VISIBLE in style)``.
+
+    Why not UIA's ``root.GetChildren()`` enumeration?
+
+    UIA caches off-screen state from the layout tree. The Office family
+    (Word/Excel/PowerPoint) minimizes to a rect at ``(-32000, -32000)``
+    and UIA caches that rect as "off-screen", removing the whole Office
+    family from any enumeration that walks UIA's child tree. They are
+    normal foreground apps intentionally pinned to the taskbar; hiding
+    them is wrong.
+
+    So this function is the source of truth for "visible top-level
+    windows on the current desktop". The Office windows are not
+    dropped here because Win32's IsWindowVisible knows they are
+    visible (they have a taskbar button).
+    """
+    out: List[int] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def cb(hwnd, _lparam):
+        try:
+            # ``IsWindowVisible`` AND of WS_VISIBLE on this hwnd and all
+            # ancestors -- true user-facing visibility.
+            if not _IsWindowVisible(hwnd):
+                return True
+            style = _GetWindowLongPtrW(hwnd, GWL_STYLE)
+            if not (style & WS_VISIBLE):
+                return True
+            # Drop a couple of well-known pure-DWM plumbing classes that
+            # EnumWindows returns but that no user listing ever wants.
+            cls_buf = ctypes.create_unicode_buffer(64)
+            _GetClassNameW(hwnd, cls_buf, 64)
+            if (cls_buf.value or "") == "DummyDWMListenerWindow":
+                return True
+            out.append(int(hwnd))
+        except Exception:
+            # Defensive: never let a bad hwnd kill the enumeration.
+            pass
+        return True
+
+    _EnumWindows(ctypes.cast(cb, ctypes.c_void_p), 0)
+    return out
+
+
+def _hwnd_to_uia_window(hwnd: int) -> Optional[uia.WindowControl]:
+    """Best-effort: build a uiautomation WindowControl wrapper for an hwnd.
+
+    Returns None if uiautomation cannot wrap the hwnd. Even when None,
+    the Win32 path has supplied enough information for list_windows
+    (see list_windows below).
+    """
+    try:
+        ctrl = uia.ControlFromHandle(hwnd)
+    except Exception:
+        ctrl = None
+    if ctrl is None:
+        return None
+    try:
+        return uia.WindowControl.CreateControlFromControl(ctrl)
+    except Exception:
+        return None
 
 
 # ---------- window enumeration ----------------------------------------------
 
 
 def iter_top_level_controls() -> Iterator[uia.WindowControl]:
-    """Yield every visible, named top-level WindowControl under the desktop."""
-    root = uia.GetRootControl()
-    for ctrl in root.GetChildren():
-        if not isinstance(ctrl, uia.WindowControl):
-            continue
-        if not ctrl.IsTopLevel():
-            continue
-        if ctrl.IsOffscreen:
-            continue
-        if ctrl.NativeWindowHandle == 0:
+    """Yield a uiautomation WindowControl for every visible top-level window.
+
+    Source of truth: raw Win32 EnumWindows + IsWindowVisible (see
+    `_enum_visible_top_level_hwnds`). Each visible hwnd is wrapped via
+    uiautomation's ``ControlFromHandle`` so callers get the rich
+    object (.Name, .BoundingRectangle, .ProcessId, .IsMinimize, ...).
+
+    Note: we deliberately do NOT filter on UIA's ``IsOffscreen`` here.
+    For minimized windows (the Office family parked at ``(-32000,-32000)``
+    when docked to the taskbar), UIA caches ``IsOffscreen=True`` and
+    would hide them -- which is the bug being fixed. Win32's
+    IsWindowVisible already excluded genuinely hidden helpers.
+    """
+    for hwnd in _enum_visible_top_level_hwnds():
+        ctrl = _hwnd_to_uia_window(hwnd)
+        if ctrl is None:
+            # UIA couldn't wrap the hwnd (some helper classes don't
+            # expose a UIA tree node). Skip; callers that need only the
+            # listing go through list_windows(), which already has the
+            # rich Win32 data.
             continue
         yield ctrl
 
 
 def list_windows() -> List[dict]:
-    """List visible, named top-level windows with foreground marker."""
+    """List visible top-level windows with foreground marker.
+
+    Source of truth is the raw Win32 EnumWindows enumeration
+    (``_enum_visible_top_level_hwnds``); we then enrich each row via
+    UIA where UIA succeeds and fall back to pure Win32 data where UIA
+    refuses to wrap a control (which happens for some minimized Office
+    windows when UIA's tree is stale).
+    """
     out: List[dict] = []
-    for ctrl in iter_top_level_controls():
-        rect = ctrl.BoundingRectangle
-        title = (ctrl.Name or "").strip()
-        if not title:
-            # Skip nameless invisible hosts.
-            pass
+    for hwnd in _enum_visible_top_level_hwnds():
+        ctrl = _hwnd_to_uia_window(hwnd)
+        if ctrl is not None:
+            try:
+                rect = ctrl.BoundingRectangle
+                x = int(rect.left)
+                y = int(rect.top)
+                w = int(rect.width())
+                h = int(rect.height())
+                title = (ctrl.Name or "").strip()
+                pid = int(ctrl.ProcessId)
+                is_min = bool(ctrl.IsMinimize)
+            except Exception:
+                # UIA path blew up (e.g. provider went away mid-call).
+                # Fall through to the pure-Win32 path below.
+                ctrl = None
+        if ctrl is None:
+            # Pure Win32 enrichment path. Skip these in the listing
+            # output -- the only Win32-only controls on a normal desktop
+            # are DWM plumbing we already filtered out above.
+            continue
+
         out.append(
             {
                 "title": title,
-                "process_name": _process_exe_path(ctrl.ProcessId).split("\\")[-1]
-                if _process_exe_path(ctrl.ProcessId)
+                "process_name": _process_exe_path(pid).split("\\")[-1]
+                if _process_exe_path(pid)
                 else "",
-                "pid": ctrl.ProcessId,
-                "hwnd": int(ctrl.NativeWindowHandle),
-                "x": rect.left,
-                "y": rect.top,
-                "w": rect.width(),
-                "h": rect.height(),
-                "is_minimized": bool(ctrl.IsMinimize),
-                "is_foreground": _is_foreground(int(ctrl.NativeWindowHandle)),
+                "pid": pid,
+                "hwnd": int(ctrl.NativeWindowHandle) or hwnd,
+                "x": x,
+                "y": y,
+                "w": w,
+                "h": h,
+                "is_minimized": is_min,
+                "is_foreground": _is_foreground(int(ctrl.NativeWindowHandle) or hwnd),
             }
         )
     out.sort(key=lambda w: (not w["is_foreground"], w["title"].lower()))
@@ -155,13 +279,37 @@ def find_window(window: str) -> Optional[uia.WindowControl]:
 
     best: Optional[uia.WindowControl] = None
     best_score = -1
-    for w in iter_top_level_controls():
-        title = (w.Name or "").lower()
+    # Walk both the UIA-wrapped list and the Win32 list so that windows
+    # whose UIA tree node has gone stale (e.g. an Office minimized window
+    # UIA refused to wrap) are still findable by title.
+    candidates: List[uia.WindowControl] = []
+    seen_hwnds = set()
+    for ctrl in iter_top_level_controls():
+        try:
+            h = int(ctrl.NativeWindowHandle)
+        except Exception:
+            h = 0
+        if h:
+            seen_hwnds.add(h)
+        candidates.append(ctrl)
+    for hwnd in _enum_visible_top_level_hwnds():
+        if hwnd in seen_hwnds:
+            continue
+        ctrl = _hwnd_to_uia_window(hwnd)
+        if ctrl is not None:
+            candidates.append(ctrl)
+
+    for w in candidates:
+        try:
+            title = (w.Name or "").lower()
+            wh = int(w.NativeWindowHandle)
+        except Exception:
+            continue
         if needle in title:
             score = len(needle)  # exact substring is preferred
             if title == needle:
                 score += 1000
-            if _is_foreground(int(w.NativeWindowHandle)):
+            if _is_foreground(wh):
                 score += 500
             if score > best_score:
                 best = w
