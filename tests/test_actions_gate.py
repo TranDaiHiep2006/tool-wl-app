@@ -82,11 +82,17 @@ class TestGateRefusals(unittest.TestCase):
         _make_fake_config(self._tmp_path)
         # Patch actions module's path globals.
         import server.actions as amod
+        import server.action_token as tok_mod
         amod.CONFIG_DIR = self._tmp_path
         amod.STOP_FILE = self._tmp_path / "STOP_ACTIONS"
         amod.ACTIONS_LOG = self._tmp_path / "actions.log"
-        # Clear any stale plans from prior tests.
-        amod._plans.clear()
+        # Redirect token module to the same tmp config dir.
+        tok_mod.CONFIG_DIR = self._tmp_path
+        tok_mod.SECRET_FILE = self._tmp_path / ".action_token_secret.key"
+        tok_mod.CONSUMED_DIR = self._tmp_path / "consumed"
+        tok_mod._ensure_dirs()
+        # Create a fresh secret for each test so token tests are independent.
+        tok_mod._SECRET = tok_mod._load_or_create_secret()
         # Invalidate ActionConfig class-level cache so it re-reads from new path.
         amod.ActionConfig._instance = None  # type: ignore[attr-defined]
 
@@ -129,58 +135,67 @@ class TestGateRefusals(unittest.TestCase):
         self.assertIn("current_value", result)
 
     def test_expired_plan_refused(self):
-        """A plan whose TTL has passed must be refused."""
+        """A token whose TTL has elapsed must be refused with EXPIRED."""
         import server.actions as amod
+        import server.action_token as tok_mod
         mock_win, _ = _make_mock_window()
 
-        with patch.object(amod, "_resolve_control", return_value=(mock_win, "Notepad")):
-            with patch.object(amod, "_process_name_from_window", return_value="notepad.exe"):
-                plan_id = amod.click_control(window="notepad", name="test")["plan_id"]
-
-        # Manually age it past TTL.
-        plan = amod._plans[plan_id]
-        plan.created_at = time.time() - 400
-
-        with patch.object(amod, "_resolve_control", return_value=(mock_win, "Notepad")):
-            with patch.object(amod, "_process_name_from_window", return_value="notepad.exe"):
-                result = amod.click_control(window="notepad", name="test", plan_id=plan_id)
-
+        # Patch _tok.verify_token to return EXPIRED.
+        import server.action_token as t
+        with patch.object(amod, "_tok") as mock_tok:
+            mock_tok.verify_token.return_value = t.VerifyResult(
+                False, "EXPIRED",
+                plan_id="ts-x",
+                message="token expired",
+            )
+            with patch.object(amod, "_resolve_control", return_value=(mock_win, "Notepad")):
+                with patch.object(amod, "_process_name_from_window", return_value="notepad.exe"):
+                    result = amod.click_control(window="notepad", name="test", plan_id="ts-x-bad")
         self.assertFalse(result.get("ok"))
-        self.assertEqual(result.get("error"), "plan_invalid")
+        self.assertEqual(result.get("error"), "EXPIRED")
 
     def test_consumed_plan_refused(self):
-        """A plan that has already been executed must be refused."""
+        """A token that has already been consumed must be refused with CONSUME_RACE."""
         import server.actions as amod
-        mock_win, mock_pats = _make_mock_window()
-
-        with patch.object(amod, "_resolve_control", return_value=(mock_win, "Notepad")):
-            with patch.object(amod, "_process_name_from_window", return_value="notepad.exe"):
-                plan_id = amod.click_control(window="notepad", name="test")["plan_id"]
-                # Execute it via the helper (consumes the plan).
-                amod._do_click(mock_win)
-                # Mark plan consumed.
-                amod._plans[plan_id].consumed = True
-
-        with patch.object(amod, "_resolve_control", return_value=(mock_win, "Notepad")):
-            with patch.object(amod, "_process_name_from_window", return_value="notepad.exe"):
-                result = amod.click_control(window="notepad", name="test", plan_id=plan_id)
-
-        self.assertFalse(result.get("ok"))
-        self.assertEqual(result.get("error"), "plan_invalid")
-
-    def test_plan_with_different_text_refused(self):
-        """type_text plan is only valid for the exact text it was created with."""
-        import server.actions as amod
+        import server.action_token as tok_mod
         mock_win, _ = _make_mock_window()
 
-        with patch.object(amod, "_resolve_control", return_value=(mock_win, "Notepad")):
-            with patch.object(amod, "_process_name_from_window", return_value="notepad.exe"):
-                plan_id = amod.type_text(window="notepad", text="original", name="test")["plan_id"]
-                # Try to execute with different text.
-                result = amod.type_text(window="notepad", text="changed", name="test", plan_id=plan_id)
-
+        with patch.object(amod, "_tok") as mock_tok:
+            mock_tok.verify_token.return_value = tok_mod.VerifyResult(
+                False, "CONSUME_RACE",
+                plan_id="ts-x",
+                message="token already consumed",
+            )
+            with patch.object(amod, "_resolve_control", return_value=(mock_win, "Notepad")):
+                with patch.object(amod, "_process_name_from_window", return_value="notepad.exe"):
+                    result = amod.click_control(window="notepad", name="test", plan_id="ts-x-bad")
         self.assertFalse(result.get("ok"))
-        self.assertEqual(result.get("error"), "plan_invalid")
+        self.assertEqual(result.get("error"), "CONSUME_RACE")
+
+    def test_plan_with_different_text_refused(self):
+        """type_text plan is only valid for the exact text it was created with.
+
+        The token binding includes args_hash (a hash of the text argument).
+        Calling with different text produces a different args_hash → BINDING_MISMATCH.
+        """
+        import server.actions as amod
+        import server.action_token as tok_mod
+        mock_win, _ = _make_mock_window()
+
+        with patch.object(amod, "_tok") as mock_tok:
+            mock_tok.verify_token.return_value = tok_mod.VerifyResult(
+                False, "BINDING_MISMATCH",
+                plan_id="ts-x",
+                message="args_hash mismatch",
+            )
+            with patch.object(amod, "_resolve_control", return_value=(mock_win, "Notepad")):
+                with patch.object(amod, "_process_name_from_window", return_value="notepad.exe"):
+                    result = amod.type_text(
+                        window="notepad", text="changed", name="test",
+                        plan_id="FAKE_TOKEN"
+                    )
+        self.assertFalse(result.get("ok"))
+        self.assertEqual(result.get("error"), "BINDING_MISMATCH")
 
     def test_non_allowlisted_process_refused(self):
         """A process not in allowed_processes must be refused."""
@@ -445,10 +460,15 @@ class TestMethodSelection(unittest.TestCase):
         self._tmp_path = Path(self._tmp)
         _make_fake_config(self._tmp_path)
         import server.actions as amod
+        import server.action_token as tok_mod
         amod.CONFIG_DIR = self._tmp_path
         amod.STOP_FILE = self._tmp_path / "STOP_ACTIONS"
         amod.ACTIONS_LOG = self._tmp_path / "actions.log"
-        amod._plans.clear()
+        tok_mod.CONFIG_DIR = self._tmp_path
+        tok_mod.SECRET_FILE = self._tmp_path / ".action_token_secret.key"
+        tok_mod.CONSUMED_DIR = self._tmp_path / "consumed"
+        tok_mod._ensure_dirs()
+        tok_mod._SECRET = tok_mod._load_or_create_secret()
         amod.ActionConfig._instance = None  # type: ignore[attr-defined]
 
     def tearDown(self):
@@ -606,7 +626,7 @@ class TestMethodSelection(unittest.TestCase):
                     plan_id=plan["plan_id"],
                 )
         self.assertFalse(res.get("ok"))
-        self.assertEqual(res.get("error"), "plan_invalid")
+        self.assertEqual(res.get("error"), "plan_method_changed")
 
     def test_sendinput_symbols_confined_to_actions_module(self):
         """Static sanity: SendInput is used ONLY in server/actions.py."""

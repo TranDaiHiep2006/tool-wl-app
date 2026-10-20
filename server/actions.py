@@ -26,7 +26,6 @@ import json
 import logging
 import os
 import time
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -37,6 +36,8 @@ import uiautomation as uia
 from server import ui_automation as _ui_mod
 
 _log = logging.getLogger("tool_wl_app.actions")
+
+from server import action_token as _tok
 
 # --------------------- paths -------------------------------------------------
 
@@ -354,68 +355,58 @@ class ActionConfig:
 PLAN_TTL_SECONDS = 300  # 5 minutes
 
 
-@dataclass
-class ActionPlan:
-    plan_id: str
-    tool: str  # "click_control" | "type_text"
-    process_name: str
-    window_title: str
-    control_name: str
-    automation_id: str
-    # For type_text only:
-    current_value: Optional[str] = None
-    new_text: Optional[str] = None
-    # How the action will be performed ("value" / "keyboard" / "invoke" /
-    # "toggle" / "select" / "expand" / "coordinate"). Bound at PLAN time so
-    # EXECUTE cannot silently escalate to a different method.
-    method: str = "value"
-    created_at: float = field(default_factory=time.time)
-    consumed: bool = False
-
-    def is_expired(self) -> bool:
-        return (time.time() - self.created_at) > PLAN_TTL_SECONDS
-
-    def is_valid_for(
-        self,
-        tool: str,
-        automation_id: str,
-        control_name: str,
-        new_text: Optional[str] = None,
-        method: Optional[str] = None,
-    ) -> bool:
-        return (
-            not self.consumed
-            and not self.is_expired()
-            and self.tool == tool
-            and self.automation_id == automation_id
-            and self.control_name == control_name
-            and (new_text is None or self.new_text == new_text)
-            and (method is None or self.method == method)
-        )
+# Tokens handle plan binding; the TTL is shared with the token module.
+PLAN_TTL_SECONDS = _tok.PLAN_TTL_SECONDS
 
 
-_plans: Dict[str, ActionPlan] = {}
+def _jval(value: Any, default: str = "") -> Any:
+    """Coerce a UIA/control attribute into a JSON-safe scalar.
+
+    uiautomation returns strings and ints for the attributes we bind,
+    but a mock or an odd control can return None or a non-primitive.
+    Anything that is not str/int/float/bool becomes its ``str()`` so the
+    token payload always serializes cleanly.
+    """
+    if value is None:
+        return default
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
 
 
-def _gc_plans() -> None:
-    """Remove expired or consumed plans to prevent unbounded growth."""
-    global _plans
-    expired = [k for k, p in _plans.items() if p.is_expired() or p.consumed]
-    for k in expired:
-        del _plans[k]
+def _build_binding(
+    tool: str,
+    process_name: str,
+    window_title: str,
+    control_name: str,
+    control_type: Any,
+    automation_id: str,
+    hwnd: Any,
+    args_hash: str,
+) -> dict:
+    """Build the canonical, cross-process-stable binding dictionary.
 
-
-def _store_plan(plan: ActionPlan) -> str:
-    _gc_plans()
-    _plans[plan.plan_id] = plan
-    return plan.plan_id
-
-
-def _consume_plan(plan_id: str) -> Optional[ActionPlan]:
-    plan = _plans.get(plan_id)
-    if plan:
-        plan.consumed = True
-    return plan
+    Every field here is stable across server processes: the window title
+    and process name come from the OS, the control identity comes from
+    UIA's *stable* attributes (name + automation_id + control type), and
+    the hwnd is the native window handle. Nothing here is a Python object
+    identity or a UIA runtime id, both of which are meaningless in a
+    different process.
+    """
+    try:
+        hwnd_int = int(hwnd) if hwnd else 0
+    except (TypeError, ValueError):
+        hwnd_int = 0
+    return {
+        "tool": tool,
+        "process": _jval(process_name),
+        "window": _jval(window_title),
+        "hwnd": hwnd_int,
+        "control_name": _jval(control_name),
+        "control_type": _jval(control_type),
+        "automation_id": _jval(automation_id),
+        "args_hash": _jval(args_hash),
+    }
 
 
 # --------------------- logging -----------------------------------------------
@@ -638,63 +629,87 @@ def click_control(
             f"control: {control_name!r} "
             f"(automation_id={automation_id_val!r})"
         )
-        plan_uuid = str(uuid.uuid4())[:16]
-        plan = ActionPlan(
-            plan_id=plan_uuid,
+        # Build the token binding for this execute call.
+        binding = _build_binding(
             tool="click_control",
             process_name=process_name,
             window_title=window_title,
             control_name=control_name,
+            control_type=getattr(ctrl, "ControlTypeName", ""),
             automation_id=automation_id_val,
-            method=method,
+            hwnd=getattr(ctrl, "NativeWindowHandle", 0),
+            args_hash=_tok._hash_args({}),
         )
-        _store_plan(plan)
+        token = _tok.issue_token(
+            tool="click_control",
+            method=method,
+            binding=binding,
+        )
+        plan_id_out = _tok.decode_token(token)["plan_id"]
         _log_event(
             "plan", "click_control", process_name, window_title,
-            control_name, f"method={label}"
+            control_name, f"method={label} plan_id={plan_id_out}"
         )
         return {
             "ok": True,
             "phase": "plan",
-            "plan_id": plan_uuid,
+            "plan_id": token,
             "description": desc,
             "method": method,
             "method_label": label,
             "expires_in_s": PLAN_TTL_SECONDS,
         }
 
-    # Phase 2: EXECUTE — plan_id provided.
-    existing_plan = _plans.get(plan_id)
-    if existing_plan is None:
+    # Phase 2: EXECUTE — token provided.
+    # verify_token checks the HMAC, TTL, consumed-on-disk, and binding.
+    # expected_args carries what we resolved at EXECUTE time. NOTE: we
+    # deliberately bind on the *resolved* window_title (not the raw
+    # `window` argument) because the title is the stable, cross-process
+    # identity of the target; the raw argument may be a fuzzy substring.
+    resolved_method = _select_click_method(ctrl)
+    expected_args = {
+        "window": window_title,
+        "automation_id": automation_id_val,
+        "name": control_name,
+    }
+    vr = _tok.verify_token(plan_id, expected_args)
+
+    # If the method changed between PLAN and EXECUTE, the token is still valid
+    # but we must refuse rather than silently using the new method.
+    if vr.ok and _tok.check_method_mismatch(
+        vr.payload["method"], resolved_method
+    ):
         _log_event(
             "refuse", "click_control", process_name, window_title,
-            control_name, f"plan_id {plan_id!r} not found"
+            control_name,
+            f"METHOD_MISMATCH: token={vr.payload['method']!r} resolved={resolved_method!r}",
         )
         return {
             "ok": False,
-            "error": "plan_not_found",
-            "message": f"plan_id {plan_id!r} not found or already consumed",
+            "error": "plan_method_changed",
+            "message": (
+                f"control's method changed between PLAN and EXECUTE: "
+                f"token approved {vr.payload['method']!r} but resolved "
+                f"control now uses {resolved_method!r}. "
+                f"Please re-plan and re-execute."
+            ),
         }
 
-    # Re-select the method and require it to match the plan. If the control
-    # changed under us (pattern appeared/vanished), refuse rather than
-    # silently doing something the user did not approve.
-    method = _select_click_method(ctrl)
-
-    if not existing_plan.is_valid_for(
-        "click_control", automation_id_val, control_name, method=method
-    ):
-        reason = "plan expired, consumed, or arguments/method mismatch"
+    if not vr.ok:
         _log_event(
             "refuse", "click_control", process_name, window_title,
-            control_name, reason
+            control_name, f"token={vr.reason}: {vr.message}"
         )
-        return {"ok": False, "error": "plan_invalid", "message": reason}
+        return {
+            "ok": False,
+            "error": vr.reason,
+            "message": vr.message,
+            "plan_id": plan_id,
+        }
 
-    # Perform the click using exactly the approved method.
+    # Token verified and consumed atomically by verify_token. Perform the click.
     try:
-        pattern_used = _do_click(ctrl, method=method)
-        _consume_plan(plan_id)
+        pattern_used = _do_click(ctrl, method=resolved_method)
         _log_event(
             "execute", "click_control", process_name, window_title,
             control_name, f"method={METHOD_LABEL[pattern_used]}"
@@ -801,28 +816,32 @@ def type_text(
             f"Set text {label} of [{control_name!r}] in window "
             f"{window_title!r} from {trunc_value!r} -> {trunc_text!r} {tail}"
         )
-        plan_uuid = str(uuid.uuid4())[:16]
-        plan = ActionPlan(
-            plan_id=plan_uuid,
+        binding = _build_binding(
             tool="type_text",
             process_name=process_name,
             window_title=window_title,
             control_name=control_name,
+            control_type=getattr(ctrl, "ControlTypeName", ""),
             automation_id=automation_id_val,
-            current_value=trunc_value,
-            new_text=trunc_text,
-            method=method,
+            hwnd=getattr(ctrl, "NativeWindowHandle", 0),
+            args_hash=_tok._hash_args({"text": text}),
         )
-        _store_plan(plan)
+        token = _tok.issue_token(
+            tool="type_text",
+            method=method,
+            binding=binding,
+        )
+        plan_id_out = _tok.decode_token(token)["plan_id"]
         _log_event(
             "plan", "type_text", process_name, window_title,
             control_name,
-            f"method={label} current={trunc_value!r} new={trunc_text!r}"
+            f"method={label} plan_id={plan_id_out} "
+            f"current={trunc_value!r} new={trunc_text!r}"
         )
         return {
             "ok": True,
             "phase": "plan",
-            "plan_id": plan_uuid,
+            "plan_id": token,
             "description": desc,
             "method": method,
             "method_label": label,
@@ -831,44 +850,62 @@ def type_text(
             "new_text": trunc_text,
         }
 
-    # Phase 2: EXECUTE.
-    existing_plan = _plans.get(plan_id)
-    if existing_plan is None:
+    # Phase 2: EXECUTE — token provided.
+    resolved_method = _select_type_method(ctrl)
+    expected_args = {
+        "window": window_title,
+        "automation_id": automation_id_val,
+        "name": control_name,
+        "text": text,
+    }
+    vr = _tok.verify_token(plan_id, expected_args)
+
+    # Re-check method: if the control gained/lost a writable ValuePattern
+    # between PLAN and EXECUTE, the resolved method may differ from the
+    # token's method. The token is still valid but we must refuse rather
+    # than silently changing the method.
+    if vr.ok and _tok.check_method_mismatch(vr.payload["method"], resolved_method):
         _log_event(
             "refuse", "type_text", process_name, window_title,
-            control_name, f"plan_id {plan_id!r} not found"
+            control_name,
+            f"METHOD_MISMATCH: token={vr.payload['method']!r} resolved={resolved_method!r}",
         )
         return {
             "ok": False,
-            "error": "plan_not_found",
-            "message": f"plan_id {plan_id!r} not found or already consumed",
+            "error": "plan_method_changed",
+            "message": (
+                f"control's type method changed between PLAN and EXECUTE: "
+                f"token approved {vr.payload['method']!r} but resolved "
+                f"control now uses {resolved_method!r}. "
+                f"Please re-plan and re-execute."
+            ),
         }
 
-    method = _select_type_method(ctrl)
-    if not existing_plan.is_valid_for(
-        "type_text", automation_id_val, control_name, text, method=method
-    ):
-        reason = "plan expired, consumed, or text/method mismatch"
+    if not vr.ok:
         _log_event(
             "refuse", "type_text", process_name, window_title,
-            control_name, reason
+            control_name, f"token={vr.reason}: {vr.message}"
         )
-        return {"ok": False, "error": "plan_invalid", "message": reason}
+        return {
+            "ok": False,
+            "error": vr.reason,
+            "message": vr.message,
+            "plan_id": plan_id,
+        }
 
-    # Perform the write using exactly the approved method.
+    # Token verified and consumed atomically by verify_token. Perform the write.
     try:
-        chars = _do_type(ctrl, text, method=method)
-        _consume_plan(plan_id)
+        chars = _do_type(ctrl, text, method=resolved_method)
         _log_event(
             "execute", "type_text", process_name, window_title,
             control_name,
-            f"method={METHOD_LABEL[method]} set={text!r}"
+            f"method={METHOD_LABEL[resolved_method]} set={text!r}"
         )
         return {
             "ok": True,
             "phase": "execute",
-            "method": method,
-            "method_label": METHOD_LABEL[method],
+            "method": resolved_method,
+            "method_label": METHOD_LABEL[resolved_method],
             "chars_typed": chars,
             "control_name": control_name,
             "automation_id": automation_id_val,

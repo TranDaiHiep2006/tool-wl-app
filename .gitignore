@@ -15,3 +15,9 @@ logs/
 # P3: per-install bridge token files (regenerated on first run).
 config/bridge_token
 extension/token.js
+
+# P4-r2: per-install action-plan HMAC secret + consumed-plan marker files.
+# Both are regenerated on first run and must never be committed: the secret
+# is what makes a plan_id unforgeable, so leaking it would break the gate.
+config/.action_token_secret.key
+data/plans/
