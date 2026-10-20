@@ -24,9 +24,19 @@ from server import screenshots as ss_mod  # noqa: E402
 from server import ui_automation as ui_mod  # noqa: E402
 
 from fastmcp import FastMCP  # noqa: E402
+from server import browser_dom as browser_dom_mod  # noqa: E402
 
 
-mcp = FastMCP("tool-wl-app")
+# P3-bridge-fix: start the loopback WS bridge eagerly on FastMCP lifespan
+# entry (instead of waiting until a get_page_* tool is called). Without this
+# the bridge never binds 127.0.0.1:57532 unless one of the browser tools is
+# invoked, AND because the bridge uses asyncio.run() for each sync tool
+# wrapper, even after a successful bind its loop would be torn down at the
+# end of the call and the listener would vanish.
+mcp = FastMCP(
+    "tool-wl-app",
+    lifespan=browser_dom_mod.create_bridge_lifespan(),
+)
 
 
 def _safe(fn, *args, **kwargs):

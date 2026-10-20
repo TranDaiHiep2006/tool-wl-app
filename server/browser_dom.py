@@ -48,8 +48,9 @@ import os
 import socket
 import sys
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 try:
     # Websockets >= 13: prefer the new asyncio implementation directly to
@@ -401,6 +402,7 @@ class DOMBridge:
 # --------------------- module-level singleton -----------------------------
 
 _bridge: Optional[DOMBridge] = None
+_bridge_stop_fn: Optional[Callable[[], None]] = None
 
 
 def _get_bridge() -> DOMBridge:
@@ -408,6 +410,122 @@ def _get_bridge() -> DOMBridge:
     if _bridge is None:
         _bridge = DOMBridge()
     return _bridge
+
+
+def stop_bridge() -> None:
+    """Stop the bridge if it is running. Safe to call even if never started."""
+    global _bridge, _bridge_stop_fn
+    if _bridge_stop_fn is not None:
+        _bridge_stop_fn()
+        _bridge_stop_fn = None
+    _bridge = None
+
+
+async def _start_bridge() -> bool:
+    """Start the bridge (idempotent, guarded). Logs to stderr."""
+    import sys as _sys
+    bridge = _get_bridge()
+    started = await bridge.start()
+    if started:
+        print(
+            "[tool-wl-app] DOM bridge listening on ws://127.0.0.1:57532",
+            file=_sys.stderr,
+        )
+    else:
+        print(
+            "[tool-wl-app] WARNING: DOM bridge failed to start "
+            "(port may be in use or websockets module missing); "
+            "get_page_text / get_page_structure will be unavailable",
+            file=_sys.stderr,
+        )
+    return started
+
+
+def create_bridge_lifespan() -> Callable[["FastMCP"], "AsyncIterator[None]"]:
+    """Return a FastMCP lifespan manager that starts/stops the DOM bridge.
+
+    Pass this as the ``lifespan=`` argument to ``FastMCP(...)`` in
+    ``mcp_server.py``::
+
+        mcp = FastMCP("tool-wl-app", lifespan=create_bridge_lifespan())
+
+    The bridge starts when FastMCP enters its event loop (before serving
+    begins) and stops cleanly when the server shuts down.  Start failures
+    are logged to stderr so they are never silent.
+    """
+
+    @asynccontextmanager
+    async def _bridge_lifespan(app: "FastMCP") -> AsyncIterator[None]:
+        """Async context manager: start bridge on enter, stop on exit.
+
+        Runs on FastMCP's long-lived asyncio loop. The WebSocket server is
+        bound to that same loop, so it stays up for the entire lifetime of
+        the MCP server and is reachable by the extension for the whole
+        session — not just during tool calls.
+        """
+        global _bridge_stop_fn
+        started = await _start_bridge()
+        # Verify the listener is actually reachable from inside the loop.
+        if started:
+            loop = asyncio.get_running_loop()
+
+            def _self_probe() -> None:
+                import socket as _s
+                ss = _s.socket()
+                ss.settimeout(1.0)
+                try:
+                    ss.connect(("127.0.0.1", BRIDGE_PORT))
+                    print(
+                        f"[tool-wl-app] bridge verified listening on ws://127.0.0.1:{BRIDGE_PORT}",
+                        file=sys.stderr,
+                    )
+                except Exception as exc:
+                    print(
+                        f"[tool-wl-app] WARNING: bridge bound but self-probe failed: {exc!r}",
+                        file=sys.stderr,
+                    )
+                finally:
+                    try:
+                        ss.close()
+                    except Exception:
+                        pass
+
+            loop.call_soon(_self_probe)
+
+        def _stop() -> None:
+            global _bridge, _bridge_stop_fn
+
+            async def _inner_stop() -> None:
+                global _bridge
+                if _bridge is not None:
+                    try:
+                        await _bridge.stop()
+                    except Exception:
+                        pass
+                    _bridge = None
+
+            try:
+                loop = asyncio.get_running_loop()
+                # Schedule the async stop so it runs before the loop closes,
+                # avoiding "coroutine was never awaited" warnings at exit.
+                loop.call_later(0, lambda: asyncio.ensure_future(_inner_stop()))
+            except Exception:
+                pass
+            _bridge_stop_fn = None
+
+        _bridge_stop_fn = _stop if started else None
+
+        try:
+            yield
+        finally:
+            if _bridge_stop_fn is not None:
+                _bridge_stop_fn()
+                _bridge_stop_fn = None
+
+    # FastMCP calls `enter_async_context` on the lifespan object, which
+    # requires it to implement the async context manager protocol.
+    # @asynccontextmanager turns our async generator into one.
+    return _bridge_lifespan  # type: ignore[return-value]
 
 
 async def _call(op: str, args: Dict[str, Any], timeout_s: float = DEFAULT_TIMEOUT_S) -> Dict[str, Any]:
@@ -491,32 +609,45 @@ async def get_page_structure_async(max_items: int = DEFAULT_STRUCTURE_MAX) -> Di
 def get_page_text_sync(max_chars: int = DEFAULT_TEXT_MAX) -> Dict[str, Any]:
     """Synchronous wrapper used by the FastMCP tool layer.
 
-    FastMCP tools may be sync or async; we expose sync to keep the tool
-    surface uniform with the other P1 tools.
+    When FastMCP is running (normal stdio path) there IS a live event loop
+    owned by FastMCP; the bridge lives on that loop too.  We must NOT call
+    asyncio.run() in this case — it would create a *new* temporary loop,
+    start the bridge on it, close it when asyncio.run() returns, and the
+    bridge would be dead before the next tool call.
+
+    Instead: detect a running loop and use
+    loop.run_until_complete() so all calls share the SAME loop and the SAME
+    bridge instance.  Only fall back to asyncio.run() when there is genuinely
+    no running loop (e.g. standalone script invocation or tests that
+    create their own loop).
     """
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
     except RuntimeError:
-        loop = None
-    if loop is None or not loop.is_running():
+        # No running loop — standalone invocation.
         return asyncio.run(get_page_text_async(max_chars))
-    # If we are already inside a running loop (shouldn't happen for FastMCP
-    # stdio tools, but be safe), fall back to running in a fresh thread.
-    import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        return ex.submit(lambda: asyncio.run(get_page_text_async(max_chars))).result()  # type: ignore[arg-type]
+    # FastMCP stdio: running loop, bridge is on it.
+    try:
+        return loop.run_until_complete(get_page_text_async(max_chars))
+    except RuntimeError as exc:
+        # e.g. "This event loop is already running" — shouldn't happen, but
+        # guard against re-entrant misuse by falling back safely.
+        return {"ok": False, "error": "async_context_error", "message": str(exc)}
 
 
 def get_page_structure_sync(max_items: int = DEFAULT_STRUCTURE_MAX) -> Dict[str, Any]:
+    """Synchronous wrapper used by the FastMCP tool layer.
+
+    Same pattern as get_page_text_sync — see that docstring.
+    """
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
     except RuntimeError:
-        loop = None
-    if loop is None or not loop.is_running():
         return asyncio.run(get_page_structure_async(max_items))
-    import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        return ex.submit(lambda: asyncio.run(get_page_structure_async(max_items))).result()  # type: ignore[arg-type]
+    try:
+        return loop.run_until_complete(get_page_structure_async(max_items))
+    except RuntimeError as exc:
+        return {"ok": False, "error": "async_context_error", "message": str(exc)}
 
 
 # --------------------- reply normalization -------------------------------
