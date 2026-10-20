@@ -735,7 +735,15 @@ under §4 "P3 architecture decisions".
 
 ### 8. Commit <hash> pushed to main
 
-(Will be filled in after the commit-and-push step.)
+`e61f6e8` — pushed to `main` at
+`https://github.com/TranDaiHiep2006/tool-wl-app`.
+
+```
+$ git log --oneline -3 origin/main
+e61f6e8 feat(p3): read Office COM contents and lockdown browser bridge
+693e673 docs: fill in commit hash in P2 REPORT after push
+6a24569 P2: deep browser DOM reading via MV3 extension + hardening
+```
 
 ```
 $ git log --oneline -5
