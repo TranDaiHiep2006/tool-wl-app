@@ -64,6 +64,26 @@ FORBIDDEN_SYMBOLS = {
     "keybd_event",
     "mouse_event",
     "SetActiveWindow",
+    # P3: Office COM mutating methods (must NEVER appear in server/*.py).
+    # These are destructive: Save overwrites user data, SaveAs / Close /
+    # PrintOut / Quit change user-visible state. P3 is read-only.
+    "Save",
+    "SaveAs",
+    "SaveAs2",
+    "Close",
+    "Quit",
+    "PrintOut",
+    "PrintPreview",
+    "NewDocument",
+    "NewWorkbook",
+    "NewPresentation",
+    "AddSlide",
+    "DeleteSlide",
+    # We use this for COM but only with explicit "Word.Application" /
+    # "Excel.Application" / "PowerPoint.Application" strings. Any other
+    # prog-id or CreateObject() would launch an Office instance, which the
+    # spec explicitly forbids ("never launch Office").
+    "CreateObject",
 }
 
 # We DO use these read-only names — confirm they are used, not banned.

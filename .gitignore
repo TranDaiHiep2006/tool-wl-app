@@ -11,3 +11,7 @@ tests/output/
 logs/
 *.log
 .DS_Store
+
+# P3: per-install bridge token files (regenerated on first run).
+config/bridge_token
+extension/token.js

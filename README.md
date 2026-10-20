@@ -1,16 +1,19 @@
 # tool-wl-app
 
 A **read-only** Model Context Protocol (MCP) server that gives the Cursor Agent
-"eyes" on a Windows desktop. P1 covered observation only — P2 adds deep browser
-DOM reading via a small MV3 extension.
+"eyes" on a Windows desktop. P1 covered observation only. P2 added deep browser
+DOM reading via a small MV3 extension. P3 added Office document reading
+(Word / Excel / PowerPoint, attach-only via COM) and a token-locked
+loopback WebSocket bridge.
 
-> Status: **P1 + P2** (read-only). No tool in this server mutates the desktop.
+> Status: **P1 + P2 + P3** (all read-only). No tool in this server mutates the
+> desktop or its documents.
 
 ---
 
 ## What it can do
 
-12 read-only tools exposed via stdio to any MCP-compatible client (Cursor
+15 read-only tools exposed via stdio to any MCP-compatible client (Cursor
 Agent, Claude Desktop, etc.):
 
 | #  | Tool                          | What it does                                                                |
@@ -26,6 +29,9 @@ Agent, Claude Desktop, etc.):
 | 9  | `read_clipboard`              | Read Windows clipboard (text or detected non-text format).                  |
 | 10 | **`get_page_text`**           | **P2 — readable article text of the active browser tab (≤ ~8000 chars).**   |
 | 11 | **`get_page_structure`**      | **P2 — pruned interactive structure of the active tab (≤ 200 items).**     |
+| 12 | **`read_word_text`**          | **P3 — full body text of the active Word document (≤ 60 000 chars).**      |
+| 13 | **`read_excel_values`**       | **P3 — values of the active workbook's named sheet (≤ 200×50 cells).**     |
+| 14 | **`read_powerpoint_text`**    | **P3 — per-slide text of the active presentation (≤ 100 slides).**         |
 
 All tools return English errors on failure. A bad call on one tool never
 crashes the server.
@@ -111,6 +117,54 @@ with install instructions and never hang the MCP server:
 }
 ```
 
+### Per-install secret token (P3)
+
+The P2 WebSocket bridge on `127.0.0.1:57532` now requires the extension
+to present a per-install secret token before any request reaches the
+data path. Unauthenticated connections are closed with WebSocket code
+**1008** ("policy violation").
+
+- The token lives at `config/bridge_token` (auto-generated on the first
+  MCP server start, gitignored) and is mirrored to
+  `extension/token.js` (also gitignored) which the service worker
+  imports at startup.
+- If you load the extension BEFORE running the MCP server for the
+  first time, `token.js` is missing and the SW logs a console warning.
+  After the MCP server has run once, **reload the extension** in
+  `chrome://extensions` so the SW re-imports the freshly-written module.
+- Rotate the token any time with:
+
+  ```powershell
+  .\.venv\Scripts\python.exe scripts\rotate_bridge_token.py
+  ```
+
+  The currently-connected extension will reconnect on its next hello
+  (MV3 service-worker backoff ≤ 30 s).
+- `register_native_host.py --allow-any-origin` is still available as an
+  explicit opt-in for development but is never the default.
+
+---
+
+## P3 — Office document reading (read-only)
+
+Three new tools attach to already-running Microsoft Office apps via
+`win32com.client.GetActiveObject` (NEVER launch Office). They are
+strictly read-only — never `Save`, `SaveAs`, `Close`, etc. — and the
+module is statically scanned in `tests/test_no_action_api.py`.
+
+| Tool | What it returns |
+| --- | --- |
+| `read_word_text()` | Full body text of the active Word document (≤ 60 000 chars). |
+| `read_excel_values(sheet=None, max_rows=200, max_cols=50)` | Values of the used range of the named sheet (or `ActiveSheet`). Empty trailing rows/cols trimmed. |
+| `read_powerpoint_text(max_slides=100)` | Per-slide text of the active presentation. |
+
+If Office is not running or no document is open, each tool returns
+`{"ok": false, "error": "office_not_running", "message": "..."}`
+without crashing the server. Vietnamese / Unicode text round-trips
+identically. A live end-to-end smoke test (`tests/manual_office_e2e_excel.py`)
+launches Excel with a real COM-created workbook and confirms Vietnamese
+cell content round-trips correctly.
+
 ---
 
 ## Install
@@ -159,7 +213,7 @@ Add an entry for this server. The full file should look like:
 }
 ```
 
-Then **restart Cursor**. In the chat, the 12 tools will appear under the
+Then **restart Cursor**. In the chat, the 15 tools will appear under the
 `tool-wl-app` MCP server name.
 
 > If Cursor does not see the change, fully close and reopen it (the
@@ -173,12 +227,15 @@ When you need screen information, follow this order to save quota:
 2. `get_foreground_window` — when you only care about the active app.
 3. `get_ui_tree` — discover named controls in that window.
 4. `get_control_text` — read a specific control.
-5. **`get_page_text` / `get_page_structure`** — **preferred for browser
+5. **`read_word_text` / `read_excel_values` / `read_powerpoint_text`** —
+   **preferred for open Office documents** (much cheaper and more
+   accurate than OCR).
+6. **`get_page_text` / `get_page_structure`** — **preferred for browser
    page content** (much cheaper than OCR/screenshot).
-6. `ocr_region` / `ocr_image` — only when UIA / DOM tools can't describe
+7. `ocr_region` / `ocr_image` — only when UIA / DOM / COM can't describe
    what you see.
-7. `find_text_on_screen` — locate text by visible string.
-8. `screenshot` — **last resort**. Never in a loop.
+8. `find_text_on_screen` — locate text by visible string.
+9. `screenshot` — **last resort**. Never in a loop.
 
 ## Tests
 
@@ -186,16 +243,18 @@ When you need screen information, follow this order to save quota:
 .\.venv\Scripts\python.exe -m pytest tests -v
 ```
 
-47 tests covering per-tool functional, no-action-API static scan, native
-messaging framing, end-to-end WebSocket round-trip, and quota budgets.
+85 tests covering per-tool functional, no-action-API static scan,
+native messaging framing, end-to-end WebSocket round-trip, per-install
+token auth, Office COM mock coverage, and quota budgets.
 
 ## Read-only by design
 
-P1 + P2 ship **only** read-only capabilities. No tool can click, type,
-focus a window, move the cursor, launch programs, or modify files
-(except temporary screenshot/OCR artifacts which are written to `%TEMP%`
-and discarded). The MV3 extension only reads DOM; it never clicks,
-types, or modifies pages. Adding action tools belongs to a later P3.
+P1 + P2 + P3 ship **only** read-only capabilities. No tool can click, type,
+focus a window, move the cursor, launch programs, save Office documents,
+or modify files (except temporary screenshot/OCR artifacts which are
+written to `%TEMP%` and discarded). The MV3 extension only reads DOM; it
+never clicks, types, or modifies pages. Adding action tools belongs to a
+later P4.
 
 ## Quota saving
 

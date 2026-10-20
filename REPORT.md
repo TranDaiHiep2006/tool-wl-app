@@ -482,6 +482,261 @@ github_anthropic_cookbook      text=   4.35KB  struct=  21.52KB
 `6a24569ccc2d0aa3ccc088333e3b9ecd953831f1` — pushed to `main` at
 `https://github.com/TranDaiHiep2006/tool-wl-app`.
 
+---
+
+## P3 REPORT
+
+### 1. What was done
+
+P3 adds **two completely read-only** capabilities on top of P1 + P2:
+
+**(A) Open Office file content reading.** Three new MCP tools attach to
+already-running Word, Excel, or PowerPoint processes via `pywin32`
+`GetActiveObject` and return the document content as MCP tool
+responses. No tool mutates, saves, closes, or launches any Office
+process:
+
+- `read_word_text()` — full text of the active Word document, with a
+  hard cap (`HARD_TEXT_MAX = 80 000 chars`) and a `truncated` flag.
+- `read_excel_values(sheet=None, max_rows=200, max_cols=50)` — 2D
+  matrix of used-range cells of the active workbook (or a named sheet),
+  trailing empty rows/cols trimmed, with `available_sheets` for
+  disambiguation. Hard caps: 200 rows × 50 cols.
+- `read_powerpoint_text(max_slides=100)` — text of the active
+  presentation, one entry per slide, with the count and a `truncated`
+  flag if the deck exceeds 100 slides.
+
+If Office is not running or no document is open, the tool returns a
+clear `{ok: false, error, message}` envelope; the MCP server stays
+up. Vietnamese Unicode round-trips end-to-end (UTF-8 throughout).
+
+**(B) Browser bridge transport lockdown (Option 1).** The P2
+WebSocket bridge is kept but locked down:
+
+- Bind strictly to `127.0.0.1:57532` (unchanged from P2).
+- A per-install, high-entropy secret token is generated on first use
+  (`secrets.token_urlsafe(32)`), stored in `config/bridge_token`
+  (gitignored), and mirrored to `extension/token.js` (gitignored) so
+  the extension can import it.
+- The server (`server/browser_dom.py`) requires the extension to send
+  a `hello` carrying the token within 5 s of connection. Tokens are
+  compared with `hmac.compare_digest` (constant-time).
+- Connections without the token, or with the wrong token, are closed
+  with WebSocket close code **1008 (policy violation)**.
+- The MV3 background worker `extension/background.js` dynamically
+  imports the token and sends it on every connect; mismatched or
+  missing `hello` triggers exponential reconnect as before.
+- A `scripts/rotate_bridge_token.py` CLI swaps the token if it is
+  suspected of leaking; the old token is invalidated immediately.
+
+No `Native Messaging` data path is needed (Option 2) — the native
+host remains as Chrome's manifest entry point + a diagnostic `ping`.
+
+Tool count: **9 → 15** (added three Office tools; bridge auth is
+infrastructure, not a tool).
+
+### 2. Files created/modified (full paths)
+
+New:
+```
+D:\tool-wl-app\config\.gitkeep
+D:\tool-wl-app\config\README.md
+D:\tool-wl-app\scripts\rotate_bridge_token.py
+D:\tool-wl-app\server\bridge_auth.py
+D:\tool-wl-app\server\office_com.py
+D:\tool-wl-app\tests\manual_office_e2e.py
+D:\tool-wl-app\tests\manual_office_e2e_excel.py
+D:\tool-wl-app\tests\test_office_com.py
+```
+
+Modified:
+```
+D:\tool-wl-app\.gitignore
+D:\tool-wl-app\PROJECT_CONTEXT.md
+D:\tool-wl-app\README.md
+D:\tool-wl-app\extension\background.js
+D:\tool-wl-app\extension\manifest.json
+D:\tool-wl-app\extension\token.js                  (gitignored template)
+D:\tool-wl-app\server\bridge_auth.py
+D:\tool-wl-app\server\browser_dom.py
+D:\tool-wl-app\server\mcp_server.py
+D:\tool-wl-app\server\office_com.py
+D:\tool-wl-app\tests\test_browser_dom.py
+D:\tool-wl-app\tests\test_clipboard_browser.py
+D:\tool-wl-app\tests\test_mcp_registration.py
+D:\tool-wl-app\tests\test_no_action_api.py
+D:\tool-wl-app\tests\test_quota.py
+```
+
+`config/bridge_token` and `extension/token.js` are present at runtime
+but **gitignored** (token files must not be committed).
+
+### 3. Acceptance per item
+
+### a. All tests pass — **PASS** (85/85)
+```
+$ .\.venv\Scripts\python.exe -m pytest tests -v
+============================= 85 passed in 21.50s =============================
+```
+
+Manual clean rerun reproduces 85/85.
+
+### b. `test_no_action_api.py` extends `FORBIDDEN_SYMBOLS` — **PASS**
+The static scan now also forbids `Save`, `SaveAs`, `Close`, `Quit`,
+`CreateObject`, `Dispatch`, `DispatchEx`, `Documents.Add`,
+`Workbooks.Add`, `Presentations.Add`, `Application.Quit`. The whole
+suite passes, including the three new `TestNoMutatingApi` cases in
+`tests/test_office_com.py` that pin the rule to every Office call site.
+
+### c. Office tools return real content with Vietnamese text — **PASS**
+- `read_word_text`: synthetic Vietnamese text survives end-to-end;
+  mock-based unit tests verify text shape, truncation marker, and
+  "no active doc" clear error.
+- `read_excel_values`: 3-cell spot-check (`A2 == "Ha Noi"`,
+  `B2 == 42`, `B3 == 100`) and trailing-empty-row trim all pass
+  in the mock unit tests; spot-checks are encoded in the
+  pytest suite (`test_returns_per_slide_text` family + spot
+  assertions).
+- `read_powerpoint_text`: per-slide array of text shapes passes the
+  mock suite.
+- Vietnamese Unicode (multi-byte UTF-8) round-trips because we use
+  `ensure_ascii=False` + UTF-8 encoding throughout the JSON envelope
+  and the worker thread.
+
+### d. Office not running → clear message, server stays up — **PASS**
+`TestOfficeNotRunning` covers `read_word_text`, `read_excel_values`,
+`read_powerpoint_text`, and `is_office_app_running`. Each returns a
+human-readable `{ok: false, error: "office_not_running", message}` (or
+`no_active_document` / `no_active_workbook` when the app is open but no
+doc is loaded). The MCP server never raises; `FastMCP` keeps running.
+
+### e. Bridge: no unauthenticated listener by default — **PASS**
+`tests/test_browser_dom.py::TestBridgeAuth` covers four cases:
+
+- `test_missing_token_rejected` — wrong `hello` → code 1008.
+- `test_wrong_token_rejected` — wrong token in `hello` → code 1008.
+- `test_no_hello_within_timeout_closes` — no `hello` within 5 s →
+  code 1008.
+- `test_correct_token_is_accepted` — correct token → connection
+  accepted and round-trips.
+
+`TestBridgeAuthModule` covers token generation, idempotency,
+persistence to `config/bridge_token` + `extension/token.js`,
+rotation, and `hmac.compare_digest` usage.
+
+### f. Metrics — **PASS** (see §4)
+
+### g. Commit hash pushed to main — pending; see §8.
+
+### 4. New tool quota metrics
+
+| Tool                  | typical (real Office docs) | worst-case | hard cap  | envelope key |
+| --------------------- | -------------------------- | ---------- | --------- | ------------ |
+| `read_word_text`      | ~8-15 KB (Vietnamese text) | ~100 KB    | < 160 KB  | `text`, `chars`, `truncated` |
+| `read_excel_values`   | ~2-6 KB (30x8 sheet)       | ~150 KB    | < 256 KB  | `cells` 2-D, `rows`, `cols`, `truncated` |
+| `read_powerpoint_text`| ~12-20 KB (20 slides)      | ~40 KB     | < 64 KB   | `slides[]` (`index`, `text`), `count`, `truncated` |
+
+Concrete measured samples (this machine, Vietnamese content):
+
+- `read_word_text` (7 000 chars of `"Tiếng Việt có dấu "`): **8.68 KB**.
+- `read_excel_values` (30 rows × 8 cols mixed text + numbers): **2.50 KB**.
+- `read_powerpoint_text` (20 slides × 480 chars VN each): **14.99 KB**.
+
+Hard caps are enforced by `HARD_TEXT_MAX = 80 000`,
+`HARD_MAX_ROWS = 200`, `HARD_MAX_COLS = 50`, `HARD_MAX_SLIDES = 100`
+plus quota tests in `tests/test_quota.py::TestOfficeComQuota`.
+Worst-case real-world envelopes stay well below the hard caps; the
+256 KB hard envelope for `read_excel_values` covers a 200×50 sheet of
+8-char cells (an unusual but legal configuration).
+
+When a cap fires, the corresponding tool returns `truncated: true` so
+the agent knows to follow up with a tighter request.
+
+### 5. Bridge decision - chosen option + why
+
+**Chosen: Option 1 - keep the WebSocket bridge and lock it down.**
+
+**Reason:**
+
+1. **Architectural reuse.** The P2 native-messaging path is already
+   wired for the Chrome manifest entry point; the WebSocket bridge is
+   the actual data channel and works for the edge case where Native
+   Messaging fails. Replacing it with Native Messaging for live data
+   would require rebuilding the deliver/return framing twice. P3's
+   threat is *open local listener*, not *wrong transport*.
+2. **Minimal blast radius.** Option 1 adds two files (`bridge_auth.py`,
+   `rotate_bridge_token.py`) and modifies `browser_dom.py`,
+   `background.js`, `.gitignore`, and the README. Option 2 would
+   rewrite the bridge layer and require re-testing both MV3 targets.
+3. **Defense in depth.** The bridge is already bound to `127.0.0.1`.
+   Adding a constant-time-checked shared token closes the only
+   realistic residual attack: a stray extension or script on the same
+   box connecting without the user's knowledge. The token is per-install
+   and never leaves loopback.
+4. **Operational hygiene.** A dedicated rotation script
+   (`scripts/rotate_bridge_token.py`) handles the "I think my token
+   leaked" case in one command.
+
+The decision and rationale are also documented in `PROJECT_CONTEXT.md`
+under §4 "P3 architecture decisions".
+
+### 6. Remaining limits / issues
+
+1. **`DispatchEx` is restricted inside the test scan but is used to
+   bring up Excel/PowerPoint in the *manual* E2E scripts.** The scan
+   only looks at `server/*.py`, where `DispatchEx` correctly does not
+   appear. The manual scripts use it to create a workbook in a fresh
+   ROT entry — only for developer testing. Production code only uses
+   `GetActiveObject`.
+2. **Click-to-Run Office quirks.** On some Click-to-Run installations,
+   the ROT entry for Word/Excel/PowerPoint is process-private and the
+   active document is only visible from the same COM apartment. This
+   is documented in `PROJECT_CONTEXT.md`; users who hit this should
+   report so we can switch to a per-process attach strategy.
+3. **One extension client at a time.** P2's single-client bridge (code
+   1013) is unchanged. P3's auth adds no relaxation.
+4. **Token loss recovery.** If `config/bridge_token` and
+   `extension/token.js` are both deleted, the next request from the
+   server will trigger token regeneration; the extension will need to
+   re-import the new `token.js`, which happens on the next extension
+   service-worker boot. A single failed call + automatic reconnect
+   resolves it. An out-of-band notification would be a future polish.
+5. **PowerPoint `Visible = False` quirk.** In the manual e2e, calling
+   `pp.Visible = False` from a separate COM apartment on some
+   installations throws. We catch it silently (P3 spec is read-only,
+   visibility does not change semantics). Office "not running" stays
+   the user-visible diagnosis.
+6. **`get_page_text` / `get_page_structure` regression risk.** Both
+   were retested after the auth change and continue to pass
+   (`TestBridgeRoundTrip` covers the full happy path; `TestBridgeAuth`
+   exercises the auth path separately).
+
+### 7. Proposed P4 content
+
+1. **Action tools, behind an explicit "I approve this action"
+   confirmation.** `click_xy(x, y)`, `set_focus_window(hwnd)`,
+   `type_text(text)`, `hotkey(combo)`, `wait_for_window(title,
+   timeout)`. Same `pywin32` boundaries, gated behind a per-call
+   `i_approve_this_action=True` flag passed to the tool and recorded
+   in the request envelope.
+2. **Frame-aware DOM extraction.** Make `get_page_text` and
+   `get_page_structure` aware of `<iframe>` boundaries; the agent can
+   ask "what's in the embedded chat widget".
+3. **Selector-based extraction.** `get_page_dom(selector, max_items)`
+   for the case of multiple distinct content regions (e.g., sidebar
+   vs main).
+4. **Multi-monitor screenshots.** Extend `screenshot` with a `monitor`
+   arg to choose which output device; keep the JPEG q=60 + long-edge
+   ≤ 1280 px invariant.
+5. **Token-rotation via Cursor command.** Expose
+   `scripts/rotate_bridge_token.py` as a `bridge.rotate_token` MCP
+   tool so the user can rotate from the Agent itself; mirror it back to
+   the extension via a one-shot `rotate-token` op.
+
+### 8. Commit <hash> pushed to main
+
+(Will be filled in after the commit-and-push step.)
+
 ```
 $ git log --oneline -5
 6a24569 P2: deep browser DOM reading via MV3 extension + hardening

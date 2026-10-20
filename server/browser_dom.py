@@ -6,6 +6,12 @@ P2 — read-only. Adds two MCP tools:
   get_page_structure() → pruned interactive structure: headings, links,
                           buttons, inputs (≤ ~200 elements).
 
+P3 hardening: every connection must present the per-install secret token
+that lives at `config/bridge_token` (and mirrored into `extension/token.js`
+so the extension can include it in its `hello` handshake). Connections
+without a matching token are rejected (WS code 1008, "policy violation")
+and never reach our data path.
+
 Priority order (also embedded in tool descriptions):
     1. get_page_text / get_page_structure — preferred for page content.
     2. screenshot / ocr_region — only when DOM tools are insufficient.
@@ -35,6 +41,7 @@ Limits (enforced)
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -78,6 +85,15 @@ DEFAULT_TEXT_MAX = 8000
 HARD_TEXT_MAX = 8000
 DEFAULT_STRUCTURE_MAX = 200
 HARD_STRUCTURE_MAX = 200
+
+# P3: token requirement can be turned off ONLY for tests/dev. Production
+# callers should always set this to True.
+AUTH_REQUIRED = True
+
+
+def secrets_compare(a: str, b: str) -> bool:
+    """Constant-time string comparison to thwart timing attacks."""
+    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
 
 
 # --------------------- exceptions ------------------------------------------
@@ -220,6 +236,11 @@ class DOMBridge:
     # ----- connection handler -----
 
     async def _handle_client(self, ws, path=None):
+        """Validate the per-install token (when AUTH_REQUIRED) and then
+        process hello/keepalive/reply messages from the extension."""
+        from server.bridge_auth import get_or_create_token
+        expected_token = get_or_create_token() if AUTH_REQUIRED else None
+
         # Only one client at a time; close older connections.
         async with self._lock:
             if self._client is not None:
@@ -227,10 +248,74 @@ class DOMBridge:
                     await self._client.close(code=1013, reason="replaced")
                 except Exception:
                     pass
-            self._client = ws
-            self._connected_at = time.time()
-        _log.info("extension connected from %s", getattr(ws, "remote_address", "?"))
+            self._client = None  # set AFTER auth succeeds
+            self._connected_at = None
+
         try:
+            if AUTH_REQUIRED:
+                # Wait for the hello handshake. The very first message MUST
+                # be a `hello` with the matching token.
+                try:
+                    first = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    _log.warning("bridge: client did not send hello within 5s; closing")
+                    try:
+                        await ws.close(code=1008, reason="auth_timeout")
+                    except Exception:
+                        pass
+                    return
+                try:
+                    hello_msg = json.loads(first)
+                except Exception:
+                    _log.warning("bridge: hello was not valid JSON; closing")
+                    try:
+                        await ws.close(code=1008, reason="auth_required")
+                    except Exception:
+                        pass
+                    return
+                if not isinstance(hello_msg, dict) or hello_msg.get("type") != "hello":
+                    _log.warning("bridge: first message must be hello; closing")
+                    try:
+                        await ws.close(code=1008, reason="auth_required")
+                    except Exception:
+                        pass
+                    return
+                presented = hello_msg.get("token")
+                if not isinstance(presented, str) or not presented:
+                    _log.warning("bridge: hello missing token; closing")
+                    try:
+                        await ws.close(code=1008, reason="auth_required")
+                    except Exception:
+                        pass
+                    return
+                if not secrets_compare(presented, expected_token or ""):
+                    _log.warning("bridge: hello token mismatch; closing")
+                    try:
+                        await ws.close(code=1008, reason="auth_failed")
+                    except Exception:
+                        pass
+                    return
+                # Auth OK — promote the client to "current".
+                async with self._lock:
+                    if self._client is not None:
+                        try:
+                            await self._client.close(code=1013, reason="replaced")
+                        except Exception:
+                            pass
+                    self._client = ws
+                    self._connected_at = time.time()
+                self._hello = hello_msg
+                _log.info("extension connected from %s (auth ok)",
+                          getattr(ws, "remote_address", "?"))
+            else:
+                # No auth required (tests/dev): accept the client immediately.
+                async with self._lock:
+                    self._client = ws
+                    self._connected_at = time.time()
+                _log.info("extension connected from %s (no auth)",
+                          getattr(ws, "remote_address", "?"))
+
+            # Main read loop. Same protocol either way: hello / keepalive / reply.
             async for raw in ws:
                 try:
                     msg = json.loads(raw)
@@ -254,7 +339,6 @@ class DOMBridge:
                 if self._client is ws:
                     self._client = None
                     self._connected_at = None
-                # Cancel any in-flight requests so callers unblock.
                 for req_id, req in list(self._pending.items()):
                     if not req.future.done():
                         req.future.set_exception(

@@ -1,65 +1,70 @@
-# P2 — tool-wl-app: Deep reading — browser DOM via extension + hardening
+# P3 — tool-wl-app: Read Office file contents via COM + lock down the browser bridge
 
 ## 1. Role
-You are a senior full-stack developer, experienced with browser extensions (MV3), Native Messaging, Python MCP servers, and Windows.
+You are a senior Python developer, experienced with Windows COM automation (pywin32), WebSocket security, and MCP servers.
 
 ## 2. Background & Goal
-- P1 done: read-only MCP server with 10 tools (UIA tree, screenshot, Windows OCR, browser tab info...). FIRST read D:\tool-wl-app\PROJECT_CONTEXT.md and D:\tool-wl-app\REPORT.md — they are the source of truth for the existing architecture. Do not re-derive it.
-- P2 goal: DEEP browser reading — the agent must read actual page content (DOM), not just the tab URL. Still READ-ONLY. No clicking/typing.
+- P1: read-only MCP server (UIA, screenshot, OCR). P2: MV3 extension + get_page_text/get_page_structure via a localhost WebSocket bridge (ws://127.0.0.1:57532). FIRST read D:\tool-wl-app\PROJECT_CONTEXT.md and D:\tool-wl-app\REPORT.md — they are the source of truth. Do not re-derive the architecture.
+- P3 has two goals: (A) read the CONTENTS of open Office files (Word/Excel/PowerPoint) — still READ-ONLY; (B) decide and lock down the browser bridge transport (section 3B).
 - Repo: https://github.com/TranDaiHiep2006/tool-wl-app, work in D:\tool-wl-app, pull latest, commit + push to main.
-- Communicate with me in English. P1 quota rules still apply: batch commands, read with purpose, fix in clusters, size-limited outputs.
+- Communicate with me in English. P1/P2 quota rules still apply: batch commands, read with purpose, fix in clusters, size-limited outputs.
 
 ## 3. Scope — DO and DO NOT
 DO:
-A. Browser extension (MV3, unpacked/dev mode) + Native Messaging host, adding 2 MCP tools:
-   1. `get_page_text()` — main readable text of the active tab (best-effort boilerplate removal: skip nav/footer/ads); max ~8000 chars, truncate + report.
-   2. `get_page_structure()` — pruned interactive structure: headings, links (text + href), buttons, inputs (label + type); max ~200 elements, truncate + report.
-   Target Chromium first (Chrome/Edge). Firefox best-effort only — if not cleanly feasible, report why and ship Chromium-only.
-B. Hardening:
-   - Fix the 2 desktop-state-sensitive pytest failures (they fail on rerun when no windows are open) — make them hermetic with mocks, or skip with a clear reason. The suite must pass regardless of desktop state.
-   - Clean up: remove tests/raw_smoke.py and D:\tool-wl-app\logs\raw_server.* (or relocate properly) — decide, do it, document it.
+A. Office COM reading (pywin32, read-only, never save/modify):
+   1. `read_word_text()` — full text of the ACTIVE Word document via GetActiveObject("Word.Application"). No active doc → clear message.
+   2. `read_excel_values(sheet=None, max_rows=200, max_cols=50)` — values of the used range (or the named sheet) of the ACTIVE workbook. Trim empty trailing rows/cols. Truncate + report.
+   3. `read_powerpoint_text()` — text of all slides of the ACTIVE presentation, as a per-slide list. Truncate + report.
+   If Office is not running or no document is open → return a clear message. NEVER launch Office, never crash the server.
+B. Browser bridge transport decision — pick ONE and implement it:
+   - Option 1 (recommended): keep the WebSocket bridge but lock it down: bind strictly to 127.0.0.1, require a per-install secret token (generated once, stored in a local config file; the extension sends it on connect; reject connections without it), remove any `--allow-any-origin` dev bypass from default paths, document the token location.
+   - Option 2: make Native Messaging the live transport (reuse the P2 native_host + registry scripts) and remove the WebSocket bridge entirely.
+   Document the choice and WHY in PROJECT_CONTEXT.md. Either way: no unauthenticated localhost listener left open by default.
 DO NOT:
 - Any action tools (click/type/focus) — still forbidden.
-- Office COM reading — that is P3, do not start it.
-- Publishing the extension to any web store.
+- Saving or modifying Office files — read-only means read-only. The COM code must never call Save/SaveAs/Close-with-save.
+- Starting Office applications — attach only to already-running instances.
 
 ## 4. Technical Decisions — FINAL where stated
-- Extension: MV3. Content script extracts DOM → background service worker → Native Messaging (length-prefixed JSON over stdin/stdout) → Python native host script in this repo.
-- Native host runs on Python 3.11 (same interpreter/venv as the MCP server). Register per-browser via HKCU registry keys — provide scripts/register_native_host.py AND scripts/unregister_native_host.py (must be reversible).
-- New tools live in the existing FastMCP server as server/browser_dom.py. English descriptions, size limits, and a priority line ("prefer get_page_text over screenshot when reading page content").
-- If the extension is not installed/connected, tools must return a clear actionable error (how to load the unpacked extension + run the register script) within a 10s timeout — never hang the server.
-- If any decision above is infeasible on this machine: REPORT before changing approach (same rule as P1).
+- pywin32 for COM. Use GetActiveObject; never CreateObject (do not launch).
+- New tools in server/office_com.py, wired into mcp_server.py. English descriptions + size limits + priority line ("prefer read_word_text / read_excel_values over OCR/screenshot for Office content").
+- COM hygiene: release objects properly so no WINWORD.EXE/EXCEL.EXE handle is leaked by our reads.
+- Vietnamese Unicode text must survive end-to-end — test with Vietnamese content in each app.
+- If Office COM is unusable on this machine (not installed, Click-to-Run quirks): REPORT before changing approach (same rule as P1/P2).
 
 ## 5. Common Pitfalls — read before coding
-- MV3 service workers are ephemeral — never keep DOM state there; pull fresh from the content script on every request.
-- Native Messaging registry path must match the exact installed browser channel — verify on this machine, do not guess.
-- Never block the MCP server event loop waiting for the browser — timeouts everywhere.
-- Prune aggressively: a raw modern page DOM can be MBs — never return it raw.
+- GetActiveObject raises when the app isn't running — catch it and return the "not running" message.
+- Large workbooks: never dump whole sheets — used-range + caps only.
+- Never block the MCP server event loop on COM calls that might hang — timeouts where feasible.
+- The bridge lockdown must not break the existing P2 tools — re-run their end-to-end after the change.
 
 ## 6. Workflow (follow in order)
 1. Read PROJECT_CONTEXT.md + REPORT.md.
-2. Build extension/ (manifest.json, content.js, background.js) + native_host/ + register/unregister scripts.
-3. Add server/browser_dom.py with the 2 tools; wire into mcp_server.py.
-4. Tests: unit tests for pruning/limits + native message framing; fix the 2 flaky P1 tests; full suite green regardless of desktop state.
-5. Manual end-to-end: load unpacked extension in Chrome/Edge, run register script, restart Cursor, call get_page_text/get_page_structure from Cursor Agent on 2–3 real pages (e.g., a news article and a GitHub page) and confirm readable output.
-6. Update README.md, PROJECT_CONTEXT.md (new tools, limits, install steps), REPORT.md (append a P2 section).
-7. Measure sample output sizes of the 2 new tools (KB).
-8. Commit + push main. Write the REPORT per section 8 template.
+2. Implement server/office_com.py (3 tools); wire into mcp_server.py.
+3. Implement the bridge decision (section 3B); update/remove code accordingly; update README install steps.
+4. Tests: unit tests with mocks for COM + caps; test_no_action_api must still pass (extend its forbidden list with Save/SaveAs if missing); full suite green on clean run and rerun.
+5. Manual end-to-end: with Word/Excel/PowerPoint open on real files (include Vietnamese text), restart Cursor, call the 3 tools from Cursor Agent and confirm correct content (spot-check 3 Excel cells).
+6. Re-verify get_page_text/get_page_structure still work after the bridge change.
+7. Update README.md, PROJECT_CONTEXT.md, REPORT.md (append P3 section).
+8. Measure sample output sizes (KB).
+9. Commit + push main. Write the REPORT per section 8 template.
 
 ## 7. Acceptance (report REAL results per item)
-- [ ] pytest fully green on a clean run AND on rerun with no windows open.
-- [ ] Extension loads unpacked with no errors; register AND unregister scripts work.
-- [ ] From Cursor Agent: get_page_text returns readable article text (within ~8KB); get_page_structure lists headings/links/buttons (within ~200 items).
-- [ ] Extension missing → tools return clear install instructions within 10s, no hang.
-- [ ] Metrics: sample sizes of both new tools in KB.
+- [ ] pytest fully green (clean run + rerun).
+- [ ] test_no_action_api passes (no action APIs, no Save/SaveAs in server code).
+- [ ] From Cursor Agent with Office apps open: read_word_text returns document text; read_excel_values returns correct cell values (3 spot-checked cells); read_powerpoint_text lists slide texts. Vietnamese text intact.
+- [ ] Office not running → clear "not running" message, server stays up.
+- [ ] Bridge: no unauthenticated localhost listener by default — verify by connecting without token → rejected (or WS bridge removed entirely).
+- [ ] Metrics: sample sizes of the 3 new tools in KB.
 - [ ] Commit hash pushed to main.
 
 ## 8. REPORT (mandatory — write after section 7; copy the template below and fill it in)
-## P2 REPORT
+## P3 REPORT
 1. What was done: ...
 2. Files created/modified (full paths): ...
 3. Acceptance per item (pass/fail + brief evidence): ...
-4. New tool quota metrics: get_page_text ? KB / get_page_structure ? KB
-5. Remaining limits / issues: ...
-6. Proposed P3 content: ...
-7. Commit <hash> pushed to main.
+4. New tool quota metrics: read_word_text ? KB / read_excel_values ? KB / read_powerpoint_text ? KB
+5. Bridge decision: chosen option + why: ...
+6. Remaining limits / issues: ...
+7. Proposed P4 content: ...
+8. Commit <hash> pushed to main.

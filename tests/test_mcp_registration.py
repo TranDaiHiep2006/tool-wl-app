@@ -27,6 +27,10 @@ EXPECTED_TOOLS = {
     # P2: browser DOM (read-only)
     "get_page_text",
     "get_page_structure",
+    # P3: Office COM (read-only)
+    "read_word_text",
+    "read_excel_values",
+    "read_powerpoint_text",
 }
 
 
@@ -47,7 +51,7 @@ class TestMCPRegistration(unittest.TestCase):
 
         names = asyncio.run(_go())
         # FastMCP may add internal tools (e.g., debug); we only assert the spec tools are present.
-        # Spec items 6a & 6b are both expected, so the set is exactly 10 names.
+        # P1 had 9 + 1 (P2 added 2 = 11). P3 added 3 Office tools → 15 total.
         self.assertEqual(len(names & EXPECTED_TOOLS), len(EXPECTED_TOOLS))
 
 

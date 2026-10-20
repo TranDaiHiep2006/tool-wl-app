@@ -19,6 +19,7 @@ from server import browser as browser_mod  # noqa: E402
 from server import browser_dom as browser_dom_mod  # noqa: E402
 from server import clipboard as clip_mod  # noqa: E402
 from server import ocr as ocr_mod  # noqa: E402
+from server import office_com as office_mod  # noqa: E402
 from server import screenshots as ss_mod  # noqa: E402
 from server import ui_automation as ui_mod  # noqa: E402
 
@@ -270,6 +271,71 @@ def get_page_text(max_chars: int = 8000) -> dict:
 )
 def get_page_structure(max_items: int = 200) -> dict:
     return browser_dom_mod.get_page_structure_sync(max_items)
+
+
+# ---------------------- P3 tools 13/14/15: Office COM (read-only) ----------
+
+@mcp.tool(
+    name="read_word_text",
+    description=(
+        "Read the full text of the ACTIVE Microsoft Word document via COM. "
+        "Attach-only — never launches Word; if Word is not running, returns "
+        "{ok: false, error: 'office_not_running'} without crashing the server.\n"
+        "PREFER read_word_text over OCR/screenshot when Word is open: it returns "
+        "the actual document text in milliseconds, with no image noise. "
+        "Vietnamese / Unicode text is preserved end-to-end.\n"
+        "Read-only: never saves, modifies, or closes the document. "
+        "Caps at 60,000 chars with `truncated: true` when the limit fires.\n"
+        "When to use: Word is foreground/visible and you need the document body.\n"
+        "When NOT to use: when no Word document is open — use list_windows first."
+    ),
+)
+def read_word_text() -> dict:
+    return office_mod.read_word_text()
+
+
+@mcp.tool(
+    name="read_excel_values",
+    description=(
+        "Read cell values of the used range of the ACTIVE Microsoft Excel "
+        "workbook via COM. Optional `sheet` argument (case-insensitive fuzzy "
+        "match); `max_rows` (default 200, hard cap 200); `max_cols` "
+        "(default 50, hard cap 50). Empty trailing rows/cols are trimmed. "
+        "Attach-only — never launches Excel; returns 'office_not_running' "
+        "if Excel is not open.\n"
+        "PREFER read_excel_values over OCR/screenshot when Excel is open: "
+        "it returns actual cell values, not pixel approximations.\n"
+        "Read-only: never saves, modifies, or closes the workbook.\n"
+        "When to use: Excel is foreground/visible and you need cell contents.\n"
+        "When NOT to use: for chart images / pivot tables — text only here."
+    ),
+)
+def read_excel_values(
+    sheet: Optional[str] = None,
+    max_rows: int = 200,
+    max_cols: int = 50,
+) -> dict:
+    return office_mod.read_excel_values(sheet=sheet, max_rows=max_rows, max_cols=max_cols)
+
+
+@mcp.tool(
+    name="read_powerpoint_text",
+    description=(
+        "Read the text of all slides of the ACTIVE Microsoft PowerPoint "
+        "presentation via COM, returned as a per-slide list. "
+        "Attach-only — never launches PowerPoint; returns 'office_not_running' "
+        "if PowerPoint is not open.\n"
+        "PREFER read_powerpoint_text over OCR/screenshot when PowerPoint is "
+        "open: it returns real slide text (title + body + table cells), "
+        "preserving Vietnamese / Unicode. Caps at `max_slides` (default 100).\n"
+        "Read-only: never saves, modifies, or closes the presentation.\n"
+        "When to use: PowerPoint is foreground/visible and you need slide "
+        "text. When NOT to use: for images / charts embedded in slides — "
+        "this tool returns text only."
+    ),
+)
+def read_powerpoint_text(max_slides: int = 100) -> dict:
+    return office_mod.read_powerpoint_text(max_slides=max_slides)
 
 
 # ---------------------- entry point ---------------------------------------

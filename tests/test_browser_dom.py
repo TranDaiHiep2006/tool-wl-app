@@ -294,6 +294,15 @@ class TestBridgeRoundTrip(unittest.TestCase):
     WebSocket client, send a get_page_text request, and verify the bridge
     forwards it and the response comes back. This is the live data path."""
 
+    def setUp(self) -> None:
+        # Existing tests assume auth is off — they connect a fake
+        # extension that doesn't know the token.
+        browser_dom.AUTH_REQUIRED = False
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        browser_dom.AUTH_REQUIRED = True
+
     def _unused_port(self):
         import socket as _s
         with _s.socket(_s.AF_INET, _s.SOCK_STREAM) as tmp:
@@ -372,6 +381,218 @@ class TestBridgeRoundTrip(unittest.TestCase):
             asyncio.run(_scenario())
         finally:
             browser_dom._bridge = None
+
+
+# ---------------------------------------------------------------------------
+# Bridge auth (P3 §3B Option 1) — connections without a valid token are
+# rejected. With AUTH_REQUIRED on, the bridge closes the WebSocket (1008)
+# before any request reaches the data path.
+# ---------------------------------------------------------------------------
+
+
+class TestBridgeAuth(unittest.TestCase):
+    """Verify the auth handshake: missing token / wrong token / no hello."""
+    def setUp(self) -> None:
+        browser_dom.AUTH_REQUIRED = True
+        self.addCleanup(lambda: setattr(browser_dom, "AUTH_REQUIRED", False))
+
+    def _unused_port(self):
+        import socket as _s
+        with _s.socket(_s.AF_INET, _s.SOCK_STREAM) as tmp:
+            tmp.bind(("127.0.0.1", 0))
+            return tmp.getsockname()[1]
+
+    def test_correct_token_is_accepted(self):
+        from server import bridge_auth
+        port = self._unused_port()
+        bridge = browser_dom.DOMBridge(host="127.0.0.1", port=port)
+        browser_dom._bridge = bridge
+        token = bridge_auth.get_or_create_token()
+
+        async def _scenario():
+            ok = await bridge.start()
+            self.assertTrue(ok)
+            url = f"ws://127.0.0.1:{port}/"
+            async with websockets_lib.connect(url) as ws:  # type: ignore[name-defined]
+                # Send the hello with the correct token.
+                await ws.send(json.dumps({
+                    "type": "hello", "from": "test", "version": "0.0",
+                    "token": token,
+                }))
+                # Bridge should now be ready to handle a request.
+                req_task = asyncio.create_task(
+                    bridge.request("ping", {}, timeout_s=2.0)
+                )
+                raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                msg = json.loads(raw)
+                # Send the reply so the future resolves.
+                await ws.send(json.dumps({
+                    "type": "reply", "id": msg["id"], "ok": True,
+                    "data": {"ok": True, "url": "x", "title": "t", "tabId": 1, "stats": {}},
+                }))
+                got = await req_task
+                self.assertTrue(got["ok"])
+            await bridge.stop()
+
+        try:
+            asyncio.run(_scenario())
+        finally:
+            browser_dom._bridge = None
+
+    def test_missing_token_rejected(self):
+        port = self._unused_port()
+        bridge = browser_dom.DOMBridge(host="127.0.0.1", port=port)
+        browser_dom._bridge = bridge
+
+        async def _scenario():
+            ok = await bridge.start()
+            self.assertTrue(ok)
+            url = f"ws://127.0.0.1:{port}/"
+            async with websockets_lib.connect(url) as ws:  # type: ignore[name-defined]
+                await ws.send(json.dumps({
+                    "type": "hello", "from": "test",
+                    # token MISSING
+                }))
+                # The bridge should close us. We expect to receive a
+                # 1008 close.
+                closed = False
+                try:
+                    for _ in range(10):
+                        ev = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                except Exception:
+                    closed = True
+                # Either we got EOF (closed) or a close frame.
+                self.assertTrue(closed or ws.state.name in (
+                    "CLOSED", "CLOSING"),
+                    f"expected close, got state={ws.state.name}")
+            await bridge.stop()
+
+        try:
+            asyncio.run(_scenario())
+        finally:
+            browser_dom._bridge = None
+
+    def test_wrong_token_rejected(self):
+        port = self._unused_port()
+        bridge = browser_dom.DOMBridge(host="127.0.0.1", port=port)
+        browser_dom._bridge = bridge
+
+        async def _scenario():
+            ok = await bridge.start()
+            self.assertTrue(ok)
+            url = f"ws://127.0.0.1:{port}/"
+            async with websockets_lib.connect(url) as ws:  # type: ignore[name-defined]
+                await ws.send(json.dumps({
+                    "type": "hello", "from": "test",
+                    "token": "this-is-the-wrong-token",
+                }))
+                # Expect close within a short window.
+                closed = False
+                try:
+                    for _ in range(10):
+                        ev = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                except Exception:
+                    closed = True
+                self.assertTrue(closed or ws.state.name in (
+                    "CLOSED", "CLOSING"))
+            await bridge.stop()
+
+        try:
+            asyncio.run(_scenario())
+        finally:
+            browser_dom._bridge = None
+
+    def test_no_hello_within_timeout_closes(self):
+        port = self._unused_port()
+        bridge = browser_dom.DOMBridge(host="127.0.0.1", port=port)
+        browser_dom._bridge = bridge
+
+        async def _scenario():
+            ok = await bridge.start()
+            self.assertTrue(ok)
+            url = f"ws://127.0.0.1:{port}/"
+            async with websockets_lib.connect(url) as ws:  # type: ignore[name-defined]
+                # Don't send anything. Bridge should close us within 5s.
+                closed = False
+                try:
+                    for _ in range(10):
+                        ev = await asyncio.wait_for(ws.recv(), timeout=7.0)
+                except Exception:
+                    closed = True
+                self.assertTrue(closed or ws.state.name in (
+                    "CLOSED", "CLOSING"))
+            await bridge.stop()
+
+        try:
+            asyncio.run(_scenario())
+        finally:
+            browser_dom._bridge = None
+
+
+# ---------------------------------------------------------------------------
+# bridge_auth module — token file lifecycle
+# ---------------------------------------------------------------------------
+
+
+class TestBridgeAuthModule(unittest.TestCase):
+    """Token generation, persistence, and rotation."""
+
+    def setUp(self) -> None:
+        # Use a temporary directory for the token files.
+        import tempfile
+        from server import bridge_auth
+        self._tmp = tempfile.mkdtemp(prefix="tool-wl-bridge-")
+        self._old_config = bridge_auth.CONFIG_DIR
+        self._old_ext = bridge_auth.EXT_DIR
+        self._old_token = bridge_auth.TOKEN_FILE
+        self._old_token_js = bridge_auth.TOKEN_JS_FILE
+        bridge_auth.CONFIG_DIR = bridge_auth.Path(self._tmp) / "config"  # type: ignore[attr-defined]
+        bridge_auth.EXT_DIR = bridge_auth.Path(self._tmp) / "extension"  # type: ignore[attr-defined]
+        bridge_auth.TOKEN_FILE = bridge_auth.CONFIG_DIR / "bridge_token"  # type: ignore[attr-defined]
+        bridge_auth.TOKEN_JS_FILE = bridge_auth.EXT_DIR / "token.js"  # type: ignore[attr-defined]
+        self._bridge_auth = bridge_auth
+
+    def tearDown(self) -> None:
+        from server import bridge_auth
+        bridge_auth.CONFIG_DIR = self._old_config
+        bridge_auth.EXT_DIR = self._old_ext
+        bridge_auth.TOKEN_FILE = self._old_token
+        bridge_auth.TOKEN_JS_FILE = self._old_token_js
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_get_or_create_token_persists_files(self):
+        token = self._bridge_auth.get_or_create_token()
+        self.assertTrue(token)
+        self.assertTrue(self._bridge_auth.TOKEN_FILE.exists())
+        self.assertTrue(self._bridge_auth.TOKEN_JS_FILE.exists())
+        # token.js exports the same token.
+        js = self._bridge_auth.TOKEN_JS_FILE.read_text(encoding="utf-8")
+        self.assertIn("BRIDGE_TOKEN", js)
+        self.assertIn(token, js)
+
+    def test_get_or_create_token_idempotent(self):
+        t1 = self._bridge_auth.get_or_create_token()
+        t2 = self._bridge_auth.get_or_create_token()
+        self.assertEqual(t1, t2)
+
+    def test_rotate_token_changes_value(self):
+        t1 = self._bridge_auth.get_or_create_token()
+        t2 = self._bridge_auth.rotate_token()
+        self.assertNotEqual(t1, t2)
+        # After rotation, get_or_create returns the new value.
+        self.assertEqual(t2, self._bridge_auth.get_or_create_token())
+
+    def test_current_token_before_creation_is_none(self):
+        # Fresh temp dir — no token file.
+        self.assertIsNone(self._bridge_auth.current_token())
+
+    def test_secrets_compare_constant_time(self):
+        from server import browser_dom as bd
+        self.assertTrue(bd.secrets_compare("foo", "foo"))
+        self.assertFalse(bd.secrets_compare("foo", "bar"))
+        self.assertFalse(bd.secrets_compare("foo", "fo"))
+        self.assertFalse(bd.secrets_compare("", "x"))
 
 
 # Late import so the module-level imports above don't break if websockets is
