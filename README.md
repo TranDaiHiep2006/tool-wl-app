@@ -29,8 +29,8 @@ Agent, Claude Desktop, etc.):
 | 12 | **`read_word_text`**          | **P3 — full body text of the active Word document (≤ 60 000 chars).**      |
 | 13 | **`read_excel_values`**       | **P3 — values of the active workbook's named sheet (≤ 200×50 cells).**     |
 | 14 | **`read_powerpoint_text`**    | **P3 — per-slide text of the active presentation (≤ 100 slides).**         |
-| 15 | **`click_control`**           | **P4 — click a control via UIA pattern (requires plan+confirm).**        |
-| 16 | **`type_text`**               | **P4 — set editable control text via ValuePattern (requires plan+confirm).** |
+| 15 | **`click_control`**           | **P4 — click a control via the method ladder (requires plan+confirm).**  |
+| 16 | **`type_text`**               | **P4 — set editable control text via the method ladder (plan+confirm).**|
 | 17 | **`focus_window`**            | **P4 — bring an allowlisted app to foreground (gate + logging).**        |
 
 All tools return English errors on failure. A bad call on one tool never
@@ -74,9 +74,101 @@ Every plan, execute, and refusal is logged to `logs/actions.log`
 
 | Tool | Description |
 | ---- | ----------- |
-| `click_control(window, automation_id?, name?)` | Click a button/menu via UIA pattern (Invoke > Toggle > SelectionItem > ExpandCollapse). Phase 1 returns a plan. |
-| `type_text(window, text, automation_id?, name?)` | Set an editable control's text via ValuePattern.SetValue. Phase 1 returns a plan showing current and new text. |
+| `click_control(window, automation_id?, name?)` | Click a button/menu via the method ladder (see below). Phase 1 returns a plan. |
+| `type_text(window, text, automation_id?, name?)` | Set an editable control's text via the method ladder. Phase 1 returns a plan showing current and new text. |
 | `focus_window(window)` | Bring an allowlisted window to foreground. No plan needed; returns honest error if Windows refuses. |
+
+### The method ladder (focus safety)
+
+> **Reported incident this fixes:** during a `type_text` execute via the
+> SendInput keyboard fallback, the user opened another app's menu at the
+> exact moment typing started, and the keystrokes went into the **user's
+> menu** instead of Notepad. `SendInput` follows the global foreground
+> focus, so the action hit whatever the user was doing.
+
+The guarantee is now: **an action may only ever affect the designated
+target app, and aborts rather than delivering input to the wrong window.**
+
+Focus-free methods are preferred; `SendInput` is a guarded last resort.
+
+| Tier | `type_text` | `click_control` | Changes foreground? |
+| ---- | ----------- | --------------- | ------------------- |
+| 1 | UIA `ValuePattern.SetValue` | UIA `Invoke` / `Toggle` / `SelectionItem` / `ExpandCollapse` | **No** |
+| 2 | `WM_SETTEXT` on the control's `NativeWindowHandle` (verified by read-back) | `BM_CLICK` / `WM_COMMAND` for Button-class controls | **No** |
+| 3 | `SendInput` keyboard typing, in ≤20-character chunks | `SendInput` coordinate click | Yes — guarded |
+
+**Tier 2 is gated by the control's class.** `WM_SETTEXT` is only offered to
+`Edit` / `RICHEDIT50W` / `RICHEDIT_CLASS` / `Static` / `Window` classes, and
+`BM_CLICK` only to the `Button` family (never to owner-drawn buttons, which
+MSDN says ignore it). Every `WM_SETTEXT` write is **verified by reading the
+value back** — a mismatch is reported as a method failure and the action
+refuses, rather than silently escalating to `SendInput`. (Windows 11
+Notepad's editor is `RichEditD2DPT`: it genuinely rejects `WM_SETTEXT`, so
+the ladder correctly falls through to tier 3.)
+
+**Tier 3 guards.** Before any keystroke or click is emitted:
+
+- The user's current foreground HWND is recorded at execute start and
+  restored in a `finally` block — on success, refusal **and** abort.
+- Focus is brought to the target, then verified: `GetForegroundWindow()`
+  must resolve to the target window **and** the control holding keyboard
+  focus (`GetGUIThreadInfo`, falling back to UIA's focused element) must
+  belong to the target window/process. Verification fails → **abort before
+  sending any input**.
+- Typing runs in chunks of **at most 20 characters**, re-verifying before
+  *every* chunk. Focus lost mid-type → stop immediately and report the exact
+  number of characters typed before the abort. Never continue.
+- Coordinate clicks re-resolve the control's rect at execute time, verify
+  `WindowFromPoint(center)` belongs to the target process, and re-check the
+  foreground immediately before the click.
+
+An abort returns:
+
+```json
+{
+  "ok": false,
+  "error": "focus_guard_abort",
+  "message": "foreground window changed to hwnd=28510320 (ToolWlEditHostV1) after 20 characters; the target window is hwnd=34079910. Aborting — keystrokes will NOT be delivered to the new window.",
+  "chars_typed": 20,
+  "requested_chars": 70,
+  "aborted": true,
+  "delivered_to_other_window": false
+}
+```
+
+### Honest limitation
+
+**True background keyboard input to arbitrary apps is impossible on
+Windows.** `SendInput` is a global synthetic-input API: the OS routes it to
+whatever window currently holds the foreground, and no API can retarget it.
+No library can make typing land in an arbitrary background window.
+
+What we guarantee instead:
+
+1. **Focus-free methods first** — for the large majority of controls, the
+   action runs against a background window and never touches focus at all.
+2. **SendInput aborts instead of ever typing into the wrong window.** If we
+   cannot *prove* the target owns the foreground, we send nothing. If focus
+   moves away mid-type, we stop at the next chunk boundary and report
+   exactly how many characters landed in the target before the abort.
+
+So the worst case is a **partial, reported, target-only** delivery — never a
+keystroke in the user's menu.
+
+### Plan/confirm and method locking
+
+The method is chosen at **PLAN** time, recorded in the signed token, and
+re-verified at **EXECUTE**. There is no silent escalation: if the resolved
+control's viable method changed in between, the action refuses with
+`plan_method_changed` and must be re-planned.
+
+When the chosen method is a `SendInput` one, the plan description carries a
+plain warning:
+
+> WARNING: this method needs the target app in front. Do not touch the
+> keyboard or mouse during the few seconds it runs, and do not switch to
+> another app — the action will abort if focus moves away, and it will never
+> type into another window.
 
 ### Read-only by design
 
@@ -297,15 +389,22 @@ When you need screen information, follow this order to save quota:
 .\.venv\Scripts\python.exe -m pytest tests -v
 ```
 
-106 tests covering per-tool functional, no-action-API static scan,
+167 tests covering per-tool functional, no-action-API static scan,
 native messaging framing, end-to-end WebSocket round-trip, per-install
-token auth, Office COM mock coverage, P4 safety gate unit tests, and
-quota budgets.
+token auth, Office COM mock coverage, P4 safety gate unit tests, the P4
+focus-safety method ladder and guards, and quota budgets.
 
 Run the P4 manual E2E (requires real desktop):
 
 ```powershell
 .\.venv\Scripts\python.exe tests\manual_actions_e2e.py
+```
+
+Run the focus-safety E2E (requires real desktop; proves background typing,
+the focus-loss abort, and the focus-free tiers):
+
+```powershell
+.\.venv\Scripts\python.exe tests\manual_focus_safety_e2e.py
 ```
 
 ## Read-only by design (P1-P3) + Action safety gate (P4)

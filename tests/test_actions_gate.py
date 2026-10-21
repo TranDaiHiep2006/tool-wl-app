@@ -73,6 +73,40 @@ def _make_mock_window(name: str = "Untitled - Notepad",
 
 # ---- test class ------------------------------------------------------------
 
+def _redirect_module_paths(tmp_path: Path) -> dict:
+    """Point actions/action_token at `tmp_path` and return the saved globals
+    so tearDown can put them back (prevents cross-file test pollution)."""
+    import server.actions as amod
+    import server.action_token as tok_mod
+    attrs = ("CONFIG_DIR", "STOP_FILE", "ACTIONS_LOG", "ACTION_CONFIG")
+    tok_attrs = ("CONFIG_DIR", "SECRET_FILE", "CONSUMED_DIR", "_SECRET")
+    saved = {f"amod.{a}": getattr(amod, a) for a in attrs}
+    saved.update({f"tok.{a}": getattr(tok_mod, a) for a in tok_attrs})
+    amod.CONFIG_DIR = tmp_path
+    amod.STOP_FILE = tmp_path / "STOP_ACTIONS"
+    amod.ACTIONS_LOG = tmp_path / "actions.log"
+    amod.ACTION_CONFIG = tmp_path / "actions.json"
+    tok_mod.CONFIG_DIR = tmp_path
+    tok_mod.SECRET_FILE = tmp_path / ".action_token_secret.key"
+    tok_mod.CONSUMED_DIR = tmp_path / "consumed"
+    tok_mod._ensure_dirs()
+    # Create a fresh secret for each test so token tests are independent.
+    tok_mod._SECRET = tok_mod._load_or_create_secret()
+    # Invalidate ActionConfig class-level cache so it re-reads from new path.
+    amod.ActionConfig._instance = None  # type: ignore[attr-defined]
+    return saved
+
+
+def _restore_module_paths(saved: dict) -> None:
+    import server.actions as amod
+    import server.action_token as tok_mod
+    for key, val in saved.items():
+        mod, attr = key.split(".", 1)
+        (amod if mod == "amod" else tok_mod).__setattr__(attr, val)
+
+
+# ---- test class ------------------------------------------------------------
+
 class TestGateRefusals(unittest.TestCase):
     """Gate rules that block actions regardless of phase."""
 
@@ -80,23 +114,10 @@ class TestGateRefusals(unittest.TestCase):
         self._tmp = tempfile.mkdtemp(prefix="tool_wl_act_")
         self._tmp_path = Path(self._tmp)
         _make_fake_config(self._tmp_path)
-        # Patch actions module's path globals.
-        import server.actions as amod
-        import server.action_token as tok_mod
-        amod.CONFIG_DIR = self._tmp_path
-        amod.STOP_FILE = self._tmp_path / "STOP_ACTIONS"
-        amod.ACTIONS_LOG = self._tmp_path / "actions.log"
-        # Redirect token module to the same tmp config dir.
-        tok_mod.CONFIG_DIR = self._tmp_path
-        tok_mod.SECRET_FILE = self._tmp_path / ".action_token_secret.key"
-        tok_mod.CONSUMED_DIR = self._tmp_path / "consumed"
-        tok_mod._ensure_dirs()
-        # Create a fresh secret for each test so token tests are independent.
-        tok_mod._SECRET = tok_mod._load_or_create_secret()
-        # Invalidate ActionConfig class-level cache so it re-reads from new path.
-        amod.ActionConfig._instance = None  # type: ignore[attr-defined]
+        self._saved = _redirect_module_paths(self._tmp_path)
 
     def tearDown(self):
+        _restore_module_paths(self._saved)
         import shutil
         try:
             shutil.rmtree(self._tmp)
@@ -459,19 +480,10 @@ class TestMethodSelection(unittest.TestCase):
         self._tmp = tempfile.mkdtemp(prefix="tool_wl_act_method_")
         self._tmp_path = Path(self._tmp)
         _make_fake_config(self._tmp_path)
-        import server.actions as amod
-        import server.action_token as tok_mod
-        amod.CONFIG_DIR = self._tmp_path
-        amod.STOP_FILE = self._tmp_path / "STOP_ACTIONS"
-        amod.ACTIONS_LOG = self._tmp_path / "actions.log"
-        tok_mod.CONFIG_DIR = self._tmp_path
-        tok_mod.SECRET_FILE = self._tmp_path / ".action_token_secret.key"
-        tok_mod.CONSUMED_DIR = self._tmp_path / "consumed"
-        tok_mod._ensure_dirs()
-        tok_mod._SECRET = tok_mod._load_or_create_secret()
-        amod.ActionConfig._instance = None  # type: ignore[attr-defined]
+        self._saved = _redirect_module_paths(self._tmp_path)
 
     def tearDown(self):
+        _restore_module_paths(self._saved)
         import shutil
         try:
             shutil.rmtree(self._tmp)
@@ -489,12 +501,14 @@ class TestMethodSelection(unittest.TestCase):
         self.assertIn("via UIA Invoke", plan["description"])
 
     def test_click_fallback_to_coordinate_when_no_pattern(self):
-        """A control with no UIA click pattern must select the coordinate
-        fallback and explicitly state it in the plan."""
+        """A control with no UIA click pattern and no Button HWND must select
+        the guarded coordinate fallback and explicitly state it in the plan."""
         import server.actions as amod
         mock_win = MagicMock()
         mock_win.Name = "Text editor"
         mock_win.AutomationId = ""
+        mock_win.NativeWindowHandle = 0
+        mock_win.GetParentControl.return_value = None
         mock_win.IsInvokePatternAvailable = False
         mock_win.IsTogglePatternAvailable = False
         mock_win.IsSelectionItemPatternAvailable = False
@@ -505,30 +519,40 @@ class TestMethodSelection(unittest.TestCase):
                 plan = amod.click_control(window="notepad", name="test")
 
         self.assertEqual(plan["method"], "coordinate")
-        self.assertIn("via coordinate click on the resolved control", plan["description"])
+        self.assertIn(
+            "via guarded coordinate click on the resolved control",
+            plan["description"],
+        )
+        # A SendInput method's plan MUST carry the "hands off" warning.
+        self.assertIn(amod.SENDINPUT_WARNING, plan["description"])
         self.assertIn("method_label", plan)
+
         # And execute MUST take the coordinate path — no Pattern.Invoke call.
         with patch.object(amod, "_resolve_control", return_value=(mock_win, "Notepad")):
             with patch.object(amod, "_process_name_from_window", return_value="notepad.exe"):
-                # Stub SendInput click so no desktop is touched.
-                with patch.object(amod, "_send_click_at", return_value=None) as sca:
+                # Stub the focus guard + SendInput click: no desktop touched.
+                with patch.object(amod, "_send_click_at", return_value=None) as sca, \
+                     patch.object(amod, "_click_guarded",
+                                  return_value=(10, 20)) as cguard, \
+                     patch.object(amod, "_force_foreground", return_value=True):
                     res = amod.click_control(
                         window="notepad", name="test", plan_id=plan["plan_id"]
                     )
         self.assertTrue(res.get("ok"))
         self.assertEqual(res["method"], "coordinate")
-        sca.assert_called_once()
-        # Bounding rectangle center should have been used.
-        called_xy = sca.call_args[0]
-        self.assertEqual(len(called_xy), 2)
+        # The click went through the guarded helper, and the raw SendInput
+        # helper was never reached directly (the guard calls it internally).
+        cguard.assert_called_once()
+        sca.assert_not_called()
 
     def test_type_selects_keyboard_when_no_value_pattern(self):
-        """A control without ValuePattern must select the keyboard
-        fallback and state so in the plan."""
+        """A control without ValuePattern and without a WM_SETTEXT-capable
+        HWND must select the guarded keyboard fallback and state it."""
         import server.actions as amod
         mock_win = MagicMock()
         mock_win.Name = "Text editor"
         mock_win.AutomationId = ""
+        mock_win.NativeWindowHandle = 0
         mock_win.IsValuePatternAvailable = False
 
         with patch.object(amod, "_resolve_control", return_value=(mock_win, "Notepad")):
@@ -537,16 +561,21 @@ class TestMethodSelection(unittest.TestCase):
 
         self.assertEqual(plan["method"], "keyboard")
         self.assertIn(
-            "via keyboard input into the focused control",
+            "via guarded keyboard input into the focused control",
             plan["description"],
         )
+        # The SendInput warning is mandatory in the plan text.
+        self.assertIn(amod.SENDINPUT_WARNING, plan["description"])
 
     def test_type_fallback_calls_send_input_focus_then_unicode(self):
-        """Execute of a keyboard-fallback plan must focus then SendInput."""
+        """Execute of a keyboard-fallback plan must focus, verify, then
+        type through the guarded chunked path."""
         import server.actions as amod
         mock_win = MagicMock()
         mock_win.Name = "Text editor"
         mock_win.AutomationId = ""
+        mock_win.NativeWindowHandle = 0
+        mock_win.GetParentControl.return_value = None
         mock_win.IsValuePatternAvailable = False
 
         with patch.object(amod, "_resolve_control", return_value=(mock_win, "Notepad")):
@@ -555,8 +584,11 @@ class TestMethodSelection(unittest.TestCase):
 
         with patch.object(amod, "_resolve_control", return_value=(mock_win, "Notepad")):
             with patch.object(amod, "_process_name_from_window", return_value="notepad.exe"):
-                with patch.object(amod, "_send_unicode_text", return_value=2) as sut, \
-                     patch.object(amod, "_uia_set_focus", return_value=None) as fcs:
+                with patch.object(amod, "_send_unicode_text_guarded",
+                                  return_value=2) as sut, \
+                     patch.object(amod, "_uia_set_focus", return_value=None) as fcs, \
+                     patch.object(amod, "_verify_typing_focus", return_value=None), \
+                     patch.object(amod, "_force_foreground", return_value=True):
                     res = amod.type_text(
                         window="notepad",
                         text="hi",
@@ -567,7 +599,7 @@ class TestMethodSelection(unittest.TestCase):
         self.assertEqual(res["method"], "keyboard")
         fcs.assert_called_once_with(mock_win)
         sut.assert_called_once()
-        # What was passed to SendInput equals the requested text.
+        # What was passed to the guarded typer equals the requested text.
         self.assertEqual(sut.call_args[0][0], "hi")
 
     def test_type_value_path_still_calls_setvalue(self):
@@ -582,7 +614,8 @@ class TestMethodSelection(unittest.TestCase):
 
         with patch.object(amod, "_resolve_control", return_value=(mock_win, "Notepad")):
             with patch.object(amod, "_process_name_from_window", return_value="notepad.exe"):
-                with patch.object(amod, "_send_unicode_text", return_value=99) as sut:
+                with patch.object(amod, "_send_unicode_text_guarded",
+                                  return_value=99) as sut:
                     res = amod.type_text(
                         window="notepad",
                         text="hello",
@@ -602,6 +635,8 @@ class TestMethodSelection(unittest.TestCase):
         no_vp = MagicMock()
         no_vp.Name = "Text editor"
         no_vp.AutomationId = ""
+        no_vp.NativeWindowHandle = 0
+        no_vp.GetParentControl.return_value = None
         no_vp.IsValuePatternAvailable = False
         with patch.object(amod, "_resolve_control", return_value=(no_vp, "Notepad")):
             with patch.object(amod, "_process_name_from_window", return_value="notepad.exe"):
@@ -613,6 +648,8 @@ class TestMethodSelection(unittest.TestCase):
         with_vp = MagicMock()
         with_vp.Name = "Text editor"
         with_vp.AutomationId = ""
+        with_vp.NativeWindowHandle = 0
+        with_vp.GetParentControl.return_value = None
         with_vp.IsValuePatternAvailable = True
         vp = MagicMock()
         vp.IsReadOnly = False

@@ -203,15 +203,12 @@ applies.
 
 | Tool | What it does |
 | ---- | ------------ |
-| `click_control(window, automation_id?, name?, plan_id?)` | Invoke / Toggle / SelectionItem / ExpandCollapse on a control; reports which pattern was used. Phase 1 returns a plan. |
-| `type_text(window, text, automation_id?, name?, plan_id?)` | Set an editable control's text via `ValuePattern.SetValue`. Phase 1 returns a plan with current + new text. |
+| `click_control(window, automation_id?, name?, plan_id?)` | Activate a control via the method ladder (§7.5); reports which method was used. Phase 1 returns a plan. |
+| `type_text(window, text, automation_id?, name?, plan_id?)` | Set an editable control's text via the method ladder (§7.5). Phase 1 returns a plan with current + new text. |
 | `focus_window(window)` | Bring an allowlisted app's window to foreground via `SetForegroundWindow`. No plan. Returns honest error if Windows refuses foreground. |
 
 **Targeting:** window by hwnd or title; control by `automation_id` and/or
 exact `Name`. Resolution must yield **exactly one** control (0 or 2+ = error).
-
-**Pattern priority for click:** `Invoke > Toggle > SelectionItem >
-ExpandCollapse`. No coordinate clicking; no `SendInput`.
 
 **Static scan:** `test_no_action_api.py` forbids all action APIs
 (`Invoke`, `SetValue`, `SetForegroundWindow`, etc.) in ALL
@@ -225,11 +222,110 @@ ExpandCollapse`. No coordinate clicking; no `SendInput`.
   refused, non-allowlisted → refused, STOP_ACTIONS → refused,
   deny-label → refused, enabled=false → refused, focus_window gate
   refusals, SetForegroundWindow failure, plan/execute/refusal logging).
+- **Focus-safety unit tests** (`tests/test_action_focus_safety.py`): hermetic
+  tests for the method-ladder order (`value → wmtext → keyboard`,
+  `Invoke → … → bmclick → coordinate`), `WM_SETTEXT` read-back verification
+  (a mismatch fails rather than escalating), the focus guard's abort reasons
+  (wrong foreground, foreign PID, focus outside target, no foreground),
+  chunking at ≤20 chars with a verification before each chunk, the
+  mid-type abort reporting the exact partial count, the coordinate-click
+  hit-test guard, plan warnings present only for `SendInput` methods, and
+  no-silent-escalation (`plan_method_changed`).
 - **E2E** (`tests/manual_actions_e2e.py`): launches Notepad with a
   temp config, exercises plan+execute plan for `type_text`, reads back
   via `get_control_text`, tests `click_control` on menu items, and
   demonstrates a real gate refusal for a non-allowlisted process.
   Not part of pytest (touches real desktop).
+- **Focus-safety E2E** (`tests/manual_focus_safety_e2e.py`): real desktop,
+  real windows. Spawns two real Win32 host processes (`tests/win32_edit_host.py`)
+  each with a genuine `Edit` control so keystroke delivery is measurable
+  cross-process. Proves (a) a background focus-free write lands without
+  changing the foreground or typing into the foreground app; (b) stealing the
+  foreground mid-type aborts at a chunk boundary with ZERO characters in the
+  stolen window; (c) real Notepad typing round-trips; (d)/(e) the BM_CLICK
+  class gate, ladder order, chunk size, and method locking.
+  Not part of pytest (touches real desktop).
+- **Cross-process** (`tests/cross_process_verify.py`): drives the real MCP
+  stdio path — plan on server A, execute on a fresh server B; same-process
+  plan+execute; and all refusal buckets (tampered → UNKNOWN, forged →
+  MALFORMED, reuse → CONSUME_RACE, wrong text → BINDING_MISMATCH).
+
+### 7.5 The method ladder — focus safety
+
+**Incident that motivated this** (P4 fix round 3): during a `type_text`
+execute via the `SendInput` keyboard fallback, the user opened another app's
+menu at the exact moment typing started, and the keystrokes went into the
+**user's menu** instead of Notepad. `SendInput` follows the *global* foreground
+focus, so the action hit whatever the user happened to be doing.
+
+**Invariant:** an action may only ever affect the designated target app, and
+**must abort rather than deliver input to the wrong window.**
+
+Focus-free methods are preferred; `SendInput` is a guarded last resort.
+
+| Tier | `type_text` | `click_control` | Touches foreground? |
+| ---- | ----------- | --------------- | ------------------- |
+| 1 | UIA `ValuePattern.SetValue` | UIA `Invoke` / `Toggle` / `SelectionItem` / `ExpandCollapse` | No |
+| 2 | `WM_SETTEXT` on `NativeWindowHandle`, verified by read-back | `BM_CLICK` + `WM_COMMAND/BN_CLICKED` for Button-class controls | No |
+| 3 | `SendInput` keyboard, ≤20-char chunks | `SendInput` coordinate click | Yes — guarded |
+
+**Key code (`server/actions.py`):**
+
+- `type_method_ladder(ctrl)` / `click_method_ladder(ctrl)` — the full order
+  for a control, best first (used by both PLAN and the unit tests).
+- `_select_type_method` / `_select_click_method` — pick the head of the ladder.
+- `_supports_wm_settext(hwnd)` — `Edit` / `RICHEDIT50W` / `RICHEDIT_CLASS` /
+  `Static` / `Window` only. Windows 11 Notepad's `RichEditD2DPT` genuinely
+  rejects `WM_SETTEXT` (verified: send returns 0, read-back empty), so the
+  class gate is load-bearing, not decorative.
+- `_supports_bm_click(hwnd)` — `Button` family only, and never for
+  owner-drawn buttons (MSDN: `BM_CLICK` is ignored by them).
+- `_do_wm_set_text` — write then **read back**; mismatch raises
+  `Refusing to escalate to keyboard input` rather than silently falling
+  through to `SendInput`.
+- `_verify_typing_focus(target_win, target_pid, ctrl, chars_typed)` —
+  returns `None` when safe, else the abort reason. Requires BOTH
+  `GetForegroundWindow() == target` AND the focused control (via
+  `GetGUIThreadInfo`, falling back to UIA's focused element) belonging to the
+  target window/process.
+- `_send_unicode_text_guarded(...)` — chunks by `TYPING_CHUNK_CHARS = 20`,
+  re-verifying **before every chunk**; raises `FocusGuardAbort` carrying the
+  honest partial count.
+- `_click_guarded(...)` — re-resolves the rect, hit-tests
+  `WindowFromPoint(center)` against the target PID, then re-checks the
+  foreground immediately before the click.
+- `_force_foreground` / `_restore_foreground` — `SetForegroundWindow` plus
+  the `AttachThreadInput` fallback; the user's original foreground HWND is
+  restored in a `finally` on success, refusal **and** abort.
+- `SENDINPUT_METHODS = {"keyboard", "coordinate"}` and `SENDINPUT_WARNING` —
+  drive the plan-text warning that only `SendInput` plans carry.
+
+**Method locking:** the method is chosen at PLAN, recorded in the signed
+token, and re-verified at EXECUTE. If the control's viable method changed in
+between, the action refuses with `plan_method_changed` — no silent
+escalation.
+
+**Test seam:** `_MIDTYPE_INTERRUPT_HOOK` is a production-unused hook invoked
+with the running character count immediately before each chunk, letting the
+E2E steal the foreground mid-type deterministically.
+
+### 7.6 Honest limitation
+
+**True background keyboard input to arbitrary apps is impossible on
+Windows.** `SendInput` is a global synthetic-input API; the OS routes it to
+whichever window holds the foreground and no API can retarget it.
+
+The guarantee we actually provide:
+
+1. **Focus-free methods first** — for most controls the action runs against
+   a background window and never touches focus at all.
+2. **SendInput aborts instead of ever typing into the wrong window** — if we
+   cannot *prove* the target owns the foreground, nothing is sent; if focus
+   moves mid-type, typing stops at the next chunk boundary and the result
+   reports exactly how many characters reached the target first.
+
+Worst case is therefore a **partial, reported, target-only** delivery — never
+a keystroke in the user's menu.
 
 ### 7.4 How the user edits the allowlist
 

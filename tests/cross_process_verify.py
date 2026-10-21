@@ -245,10 +245,25 @@ def check_b_same_process():
     """(b) plan + execute in one process must still work."""
     print("\n(b) same-process: plan + execute in one server")
     text = "same-proc-ok"
+    # Notepad titles its window after the document's first line, so every
+    # execute changes the title. Re-resolve the live window for each call
+    # instead of reusing the title captured once at module import — otherwise
+    # the plan binds to a window title that no longer exists.
+    global WINDOW_TITLE
     p = spawn_server()
     try:
         init(p)
+        WINDOW_TITLE = discover_notepad_title()
+        if not WINDOW_TITLE:
+            record("(b) same-process plan->execute", False,
+                   "no Notepad window found")
+            return
         plan = call(p, "type_text", plan_args(text), 5)
+        if not plan.get("ok"):
+            record("(b) same-process plan->execute", False,
+                   f"plan failed: {plan}")
+            return
+        WINDOW_TITLE = discover_notepad_title()
         res = call(p, "type_text", {**plan_args(text), "plan_id": plan["plan_id"]}, 6)
     finally:
         kill(p)
