@@ -54,7 +54,7 @@ class MCPError(Exception):
 HELP_TEXT = """Commands
   windows                       list open windows
   shot                          capture the screen (returns an image ref)
-  read <window>                 read a control's text from a window
+  read <window> | <control>     read text from a specific control in a window
   type <window> | <text>        type text into a window's editable control
   click <window> | <control>    click a named control in a window
   focus <window>                bring an allowlisted window to the front
@@ -329,7 +329,12 @@ def format_shot(payload: Any) -> str:
     if payload.get("ok") is False or payload.get("error"):
         return f"[!] screenshot failed: {payload.get('error')}"
     size = payload.get("size") or {}
-    dims = f"{size.get('w')}x{size.get('h')}" if size else "?"
+    w = payload.get("width")
+    h = payload.get("height")
+    if not w or not h:
+        w = w or size.get("w") or size.get("width")
+        h = h or size.get("h") or size.get("height")
+    dims = f"{w}x{h}" if (w and h) else "?"
     path = payload.get("path") or payload.get("file") or "(saved)"
     return f"screenshot: {dims} → {path}"
 
@@ -399,8 +404,22 @@ class ConsoleSession:
         return format_shot(self.client.call_tool("screenshot", {"mode": "screen"}))
 
     def cmd_read(self, window: str) -> str:
+        # `read <window>` alone reads the focused control inside the window;
+        # users can target a specific control via the MCP path. The console
+        # keeps its grammar small, so an empty selector is a clean error
+        # telling the user to provide both pieces.
+        if "|" not in window:
+            return (
+                "read: need 'read <window> | <control_name_or_id>'"
+            )
+        win_part, _, sel_part = window.partition("|")
+        win_part = win_part.strip()
+        sel_part = sel_part.strip()
+        if not win_part or not sel_part:
+            return "read: both the window and the control must be non-empty"
         payload = self.client.call_tool(
-            "get_control_text", {"window": window, "automation_id_or_name": ""}
+            "get_control_text",
+            {"window": win_part, "automation_id_or_name": sel_part},
         )
         return format_read(payload)
 
@@ -415,7 +434,7 @@ class ConsoleSession:
         return self._plan_then_execute("click_control", args, self.approve)
 
     def cmd_type(self, window: str, text: str) -> str:
-        args = {"window": window, "text": text, "name": "Text editor"}
+        args = {"window": window, "text": text}
         return self._plan_then_execute("type_text", args, self.approve)
 
     # -- approval flow --

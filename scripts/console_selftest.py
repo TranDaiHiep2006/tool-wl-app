@@ -201,6 +201,35 @@ def run_selftest(root: Path) -> int:
         _check("MCP in-process", False, "exception raised")
         failures += 1
 
+    # ---- live subprocess round-trip -------------------------------------
+    # Spawns the real MCP server over stdio and exercises initialize +
+    # tools/list end-to-end. This is what the audit calls "a live server
+    # round-trip" and what the in-process branch above does not cover.
+    _section("MCP live subprocess round-trip (stdio JSON-RPC)")
+    try:
+        from console_core import MCPClient, _find_python
+
+        client = MCPClient(_find_python(root), root)
+        client.start()
+        try:
+            tools = client.list_tools()
+            n = len(tools)
+            if not _check(
+                f"live init+tools/list (n={n})",
+                n >= 18,
+                f"client={_find_python(root)}",
+            ):
+                failures += 1
+        finally:
+            try:
+                client.stop()
+            except Exception:
+                pass
+    except Exception as e:
+        traceback.print_exc()
+        _check("live subprocess", False, f"{type(e).__name__}: {e}")
+        failures += 1
+
     # ---- summary -------------------------------------------------------
     _section("summary")
     if failures == 0:
