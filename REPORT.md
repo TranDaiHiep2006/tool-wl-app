@@ -2187,15 +2187,15 @@ without any per-app special-casing.
 ### 8. Commit hash pushed to main
 
 ```
-$ git log --oneline origin/main | head -3
-<commit>  P5: Vietnamese end-to-end, focus-free window-message
-           typing, run_sequence under one approval, persistent console
-<commit>  docs: P5 REPORT + PROJECT_CONTEXT + README updated
-<commit>  P4 fix round 3: focus-safe method ladder; SendInput can
-           never type into the wrong window
+$ git log --oneline -3 origin/main
+94e3c34 P5: Vietnamese end-to-end, focus-free window-message typing,
+         run_sequence under one approval, persistent console
+f77aea9 P4 fix round 3: focus-safe method ladder; SendInput can never
+         type into the wrong window
+5a1dad1 docs(p4-r2): add P4 fix round 2 report
 ```
 
-The exact commit hash and full log are filled in immediately after
-the push, before the report is finalised.
+**`94e3c34`**, pushed to `main` at
+`https://github.com/TranDaiHiep2006/tool-wl-app`.
 
 (End of P5.)
