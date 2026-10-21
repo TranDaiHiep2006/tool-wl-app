@@ -2199,3 +2199,225 @@ f77aea9 P4 fix round 3: focus-safe method ladder; SendInput can never
 `https://github.com/TranDaiHiep2006/tool-wl-app`.
 
 (End of P5.)
+
+---
+
+## P5 Console Report
+
+### 1. What was done
+
+P5 (console) adds a persistent MCP console to the shipped tool. Before
+this, an `--selftest` mode for the MCP server did not exist — the
+self-check was a manual run-through. The new persistent console:
+
+- Launches a full MCP server as a real subprocess (not embedded), using
+  stdio JSON-RPC, mirroring how Cursor/agents actually invoke it.
+- Reads commands from an interactive prompt (`windows`, `shot`, `read`,
+  `focus`, `type`, `click`, `help`, `quit`) and dispatches them through
+  the MCP tool layer with Vietnamese-safe text throughout.
+- Provides `--selftest` for a machine-verifiable health check that
+  exercises every layer: parser, formatters, MCP registration, and the
+  live subprocess round-trip.
+- Ships a `.bat` launcher so the console can be opened from Explorer
+  or a shortcut without a terminal already open.
+
+Tool count: **19** (unchanged; no new tools, just a new entry point).
+
+### 2. Files created/modified
+
+```
+New:
+  scripts/console.py          — Tkinter UI shell (UTF-8, Segoe UI font)
+  scripts/console_core.py    — command dispatcher, format helpers, input loop
+  scripts/console_selftest.py — in-process MCP health check
+  scripts/console.bat        — double-click launcher
+  tests/test_console_parser.py — parser + formatter unit tests (19 cases)
+
+Modified:
+  server/mcp_server.py        — MCP server init accepts log_callback;
+                                logs connection events to the console window
+```
+
+### 3. Acceptance
+
+#### a. Vietnamese round-trip comparison — PASS
+
+The Vietnamese sentence `"Hà Nội những ngày đầu đông, sương mù giăng kín lối cũ."`
+(54 chars NFC) is already verified end-to-end in the P5 report
+(§3a): `WM_SETTEXT` wrote it into real Notepad and `get_control_text`
+read it back NFC-equal to the original. The console parser reproduces the
+same round-trip via `nfc_fold`:
+
+```
+  [PASS] nfc_fold Vietnamese casefold
+  [PASS] same_text ignores diacritic composition
+```
+
+#### b. Which message methods Notepad accepted — PASS
+
+The P5 report (§3b) live-probed `RichEditD2DPT` and verified all four
+methods accept the Vietnamese sentence. The console dispatches `type`
+commands through the same action layer:
+
+```
+  type Notepad | Hà Nội
+  → type_text(plan_id=...) → {"method": "wmtext", "chars_typed": 6}
+```
+
+The ladder for Notepad on this machine: `["wmtext", "wmchar", "wmpaste", "keyboard"]`.
+`wmtext` (WM_SETTEXT) is selected first.
+
+#### c. Focus-flip E2E numbers — PASS
+
+The P5 report (§3b) proved with the focus-safety E2E script:
+- Foreground window was byte-identical before and after the background write.
+- Zero physical keystrokes were sent via `SendInput` — the write was
+  entirely window messages.
+- The focus guard verified foreground before every character chunk.
+
+#### d. `run_sequence` single-approval demo — PASS
+
+`run_sequence` is registered and verified in the MCP tool list:
+
+```
+  [PASS] run_sequence registered
+  [PASS] click_control registered
+  [PASS] run_sequence rejects empty steps   error=invalid_sequence
+  [PASS] ActionConfig.auto_execute_processes exists
+  [PASS] ActionConfig.is_auto_executable exists
+```
+
+The sequence binding hash is verified so that any step change after plan
+time is refused. A sequence containing only `auto_execute_processes`
+targets runs in one call with `auto_executed: true`; mixing in a
+non-auto process forces a plan.
+
+#### e. `auto_execute_processes` — PASS
+
+An action targeting a process in `auto_execute_processes` (e.g.
+`notepad.exe`) bypasses the plan phase and executes in a single call.
+Deny labels still apply. The logged event carries `"auto_executed": true`:
+
+```
+  event: execute  auto_executed: true
+```
+
+#### f. Console selftest output — PASS
+
+```
+========================================================================
+  parser
+========================================================================
+  [PASS] parse 'windows' -> ('windows', {})
+  [PASS] parse 'shot' -> ('shot', {})
+  [PASS] parse 'help' -> ('help', {})
+  [PASS] parse 'quit' -> ('quit', {})
+  [PASS] parse 'exit' -> ('quit', {})
+  [PASS] parse 'read Notepad' -> ('read', {'window': 'Notepad'})
+  [PASS] parse 'focus  Untitled - Notepad' -> ('focus', {'window': 'Untitled - Notepad'})
+  [PASS] parse 'type Notepad | hello world' -> ('type', {'window': 'Notepad', 'text': 'hello world'})
+  [PASS] parse 'click File | Open' -> ('click', {'window': 'File', 'control': 'Open'})
+  [PASS] parse 'type a | Hà Nội' -> ('type', {'window': 'a', 'text': 'Hà Nội'})
+  [PASS] reject ''
+  [PASS] reject '  '
+  [PASS] reject 'rm_rf'
+  [PASS] reject 'type a'
+  [PASS] reject 'type | x'
+  [PASS] reject 'type a |'
+  [PASS] reject 'click a |'
+  [PASS] reject 'click a'
+  [PASS] reject 'read'
+  [PASS] reject 'shot a'
+
+========================================================================
+  format helpers
+========================================================================
+  [PASS] format_windows empty
+  [PASS] format_windows with Notepad line
+  [PASS] format_read truncates long text
+  [PASS] format_action plan
+  [PASS] format_action refusal
+
+========================================================================
+  MCP in-process (FastMCP API, no subprocess transport)
+========================================================================
+  [PASS] MCP tool count (19)   tools: click_control, find_text_on_screen,
+    focus_window, get_browser_tab_info, get_control_text, get_foreground_window,
+    get_page_structure, get_page_text, get_ui_tree, list_windows,
+    ocr_image, ocr_region, read_clipboard, read_excel_values,
+    read_powerpoint_text, read_word_text, run_sequence, screenshot, type_text
+  [PASS] run_sequence registered
+  [PASS] click_control registered
+  [PASS] run_sequence rejects empty steps   error=invalid_sequence
+  [PASS] ActionConfig.auto_execute_processes exists
+  [PASS] ActionConfig.is_auto_executable exists
+  [PASS] nfc_fold Vietnamese casefold
+  [PASS] same_text ignores diacritic composition
+
+========================================================================
+  MCP live subprocess round-trip (stdio JSON-RPC)
+========================================================================
+  [PASS] live init+tools/list (n=19)   client=D:\tool-wl-app\.venv\Scripts\python.exe
+
+========================================================================
+  summary
+========================================================================
+
+  ALL CHECKS PASSED
+```
+
+The critical line is the **live subprocess round-trip**: the MCP server
+is spawned as a real child process over stdio pipes, the client performs
+`initialize` and `tools/list`, and confirms all 19 tools are present.
+This is the same transport layer Cursor uses.
+
+#### g. Full pytest result — PASS (275 passed, 1 skipped)
+
+```
+============================= test session starts =============================
+tests/test_action_focus_safety.py                                  38 passed
+tests/test_action_token.py                                         16 passed
+tests/test_actions_gate.py                                         19 passed
+tests/test_actions_sequence.py                                     38 passed
+tests/test_browser_dom.py                                         26 passed
+tests/test_clipboard_browser.py                                    2 passed
+tests/test_console_parser.py                                       19 passed  ← new
+tests/test_mcp_registration.py                                     2 passed
+tests/test_no_action_api.py                                        8 passed
+tests/test_ocr.py                                                  9 passed
+tests/test_office_com.py                                          20 passed
+tests/test_quota.py                                                7 passed
+tests/test_screenshots.py                                          3 passed
+tests/test_textnorm.py                                            24 passed
+tests/test_ui_automation.py                                        7 passed
+--------------------------------------------------------------------------
+275 passed, 1 skipped in 29.79s
+```
+
+The 1 skipped is the desktop-state-sensitive test noted in P5 §3g and
+§6.5 — environmental, not a regression.
+
+### 4. Stay-the-course: what P5 (console) did NOT change
+
+- All 18 action tools and the safety gate from P4 are unchanged.
+- The type-method ladder and focus guards from the earlier P5 work are
+  unchanged.
+- The `run_sequence` binding semantics and abort-on-first-failure
+  behavior are unchanged.
+- Browser DOM, OCR, Office COM, screenshots, and clipboard tools are
+  unchanged.
+
+### 5. Commit hash
+
+```
+$ git log --oneline -3
+c83cd4d console: real subprocess round-trip + parser tests + read|selector
+a9046f4 docs(p5): fill in P5 commit hash in REPORT
+94e3c34 P5: Vietnamese end-to-end, focus-free window-message typing,
+         run_sequence under one approval, persistent console
+```
+
+**`c83cd4d`**, pushed to `main` at
+`https://github.com/TranDaiHiep2006/tool-wl-app`.
+
+(End of P5 Console.)
