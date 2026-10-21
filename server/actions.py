@@ -17,10 +17,19 @@ Safety gate rules (checked in BOTH phases):
 
 METHOD LADDER — focus-free first, SendInput as a guarded last resort:
 
-  type_text    : ValuePattern.SetValue → WM_SETTEXT (read-back verified)
-                 → SendInput keyboard, ≤20-char chunks, re-verified each chunk
-  click_control: UIA Invoke/Toggle/SelectionItem/ExpandCollapse
+    type_text    : ValuePattern.SetValue → WM_SETTEXT (read-back verified)
+                 → WM_CHAR / EM_REPLACESEL / WM_PASTE (P5 B1, read-back
+                   verified; all focus-free and IME-free)
+                 → SendInput keyboard, re-verified before EVERY character
+    click_control: UIA Invoke/Toggle/SelectionItem/ExpandCollapse
                  → BM_CLICK (Button class) → SendInput coordinate click
+
+P5 B1 note: a live probe (tests/probe_msg_input_candidates.py) proved
+that Windows 11 Notepad's RichEditD2DPT control — which P4 classified as
+having "no focus-free method" — accepts WM_SETTEXT, WM_CHAR,
+EM_REPLACESEL and WM_PASTE, all with exact Vietnamese round-trip. That
+pushes SendInput much further down the ladder for the most common target
+app on a Windows box.
 
 SendInput follows the GLOBAL foreground focus, which is exactly how a real
 incident typed text into the user's own menu instead of the target app. So
@@ -28,11 +37,13 @@ before any input is emitted we must PROVE the target owns the foreground:
 
   * the user's foreground HWND is captured and restored in a `finally`
     (on success, refusal and abort alike);
-  * after focusing, GetForegroundWindow() must be the target window AND the
-    control holding keyboard focus (GetGUIThreadInfo, else UIA's focused
-    element) must belong to the target window/process — else abort BEFORE
-    sending anything;
-  * typing re-verifies before every ≤20-character chunk and raises
+  * P5 B2: if the target is not ALREADY the foreground window, typing
+    aborts with a specific error instead of stealing focus and racing the
+    user;
+  * the control holding keyboard focus (GetGUIThreadInfo, else UIA's
+    focused element) must belong to the target window/process — else abort
+    BEFORE sending anything;
+  * P5 B2: typing re-verifies before every SINGLE character and raises
     FocusGuardAbort with the honest partial count if focus is lost;
   * a coordinate click re-resolves the rect, hit-tests WindowFromPoint
     against the target PID, and re-checks the foreground immediately before
@@ -67,6 +78,9 @@ import uiautomation as uia
 
 # Re-use the init() from ui_automation so we have a sane UIA apartment.
 from server import ui_automation as _ui_mod
+
+# Vietnamese-safe matching (NFC + casefold) — see server/textnorm.py.
+from server.textnorm import contains_text, nfc, nfc_fold, same_text
 
 _log = logging.getLogger("tool_wl_app.actions")
 
@@ -189,6 +203,18 @@ _BM_CLICK = 0x00F5
 _WM_COMMAND = 0x0111
 _BN_CLICKED = 0x0000
 
+# P5 Section B1 — message-based character input. These were probed against
+# THIS machine's Windows 11 Notepad (control class RichEditD2DPT) with
+# read-back verification; see tests/probe_msg_input_candidates.py. All four
+# wrote correctly and round-tripped composed Vietnamese exactly, so they
+# form a focus-free tier between WM_SETTEXT and SendInput.
+_WM_CHAR = 0x0102          # send one character as a message
+_WM_PASTE = 0x0302         # paste CF_UNICODETEXT from the clipboard
+_EM_REPLACESEL = 0x00C2    # replace the current selection (RichEdit family)
+
+_CF_UNICODETEXT = 13
+_GMEM_MOVEABLE = 0x0002
+
 _SMTO_ABORTIFHUNG = 0x0002
 _MESSAGE_TIMEOUT_MS = 2000
 
@@ -239,6 +265,10 @@ class FocusGuardAbort(RuntimeError):
 # The typing guard is deliberately conservative: every chunk re-verifies.
 TYPING_CHUNK_CHARS = 20
 CHUNK_SETTLE_S = 0.03
+# P5 B2: the per-character verification tightened the cadence. A tiny sleep
+# keeps the target app's input queue drained without making a long string
+# feel glacial.
+CHAR_SETTLE_S = 0.002
 
 # Test-only seam (see tests/manual_focus_safety_e2e.py). When set to a
 # callable, it is invoked with the running character count immediately
@@ -649,18 +679,187 @@ def _wm_set_text(hwnd: int, text: str) -> bool:
     return _send_msg(hwnd, _WM_SETTEXT, 0, buf) != 0
 
 
+# --------------------- clipboard (write, used only for WM_PASTE) ------------
+# WM_PASTE needs CF_UNICODETEXT on the clipboard. The user's clipboard is
+# real, precious data: every path here saves it first and restores it in a
+# `finally`, so a failure mid-paste cannot destroy what the user copied.
+
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+_kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+_kernel32.GlobalLock.restype = ctypes.c_void_p
+_kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+_kernel32.GlobalUnlock.restype = wintypes.BOOL
+_kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+_kernel32.GlobalSize.restype = ctypes.c_size_t
+_kernel32.GlobalSize.argtypes = [wintypes.HGLOBAL]
+
+_OpenClipboard = _user32.OpenClipboard
+_OpenClipboard.argtypes = [wintypes.HWND]
+_OpenClipboard.restype = wintypes.BOOL
+_GetClipboardData = _user32.GetClipboardData
+_GetClipboardData.argtypes = [wintypes.UINT]
+_GetClipboardData.restype = wintypes.HANDLE
+_SetClipboardData = _user32.SetClipboardData
+_SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+_SetClipboardData.restype = wintypes.HANDLE
+_EmptyClipboard = _user32.EmptyClipboard
+_EmptyClipboard.argtypes = []
+_EmptyClipboard.restype = wintypes.BOOL
+_CloseClipboard = _user32.CloseClipboard
+_CloseClipboard.argtypes = []
+_CloseClipboard.restype = wintypes.BOOL
+
+
+def _open_clipboard_with_retry(max_attempts: int = 40, sleep_s: float = 0.025) -> bool:
+    """Open the clipboard, retrying if another app is holding it.
+
+    Some Win32 apps (Notepad's RichEditD2DPT, in particular) briefly
+    hold the clipboard open after a paste. Bounded retry + short sleep
+    means we never block longer than ~1 s.
+    """
+    for _ in range(max_attempts):
+        if _OpenClipboard(None):
+            return True
+        time.sleep(sleep_s)
+    return False
+
+
+def _clipboard_read_text() -> Optional[str]:
+    """Current CF_UNICODETEXT, or None when the clipboard holds no text.
+
+    None (not "") is meaningful: it means "the user's clipboard held
+    something we cannot restore", which the caller must surface rather
+    than silently overwrite with our probe text.
+    """
+    if not _open_clipboard_with_retry():
+        return None
+    try:
+        handle = _GetClipboardData(_CF_UNICODETEXT)
+        if not handle:
+            return None
+        ptr = _kernel32.GlobalLock(handle)
+        if not ptr:
+            return None
+        try:
+            size = _kernel32.GlobalSize(handle)
+            raw = ctypes.string_at(ptr, size)
+            return raw.decode("utf-16-le", errors="ignore").rstrip("\x00")
+        finally:
+            _kernel32.GlobalUnlock(handle)
+    except Exception:
+        return None
+    finally:
+        _CloseClipboard()
+
+
+def _clipboard_set_text(text: str) -> bool:
+    """Replace CF_UNICODETEXT on the clipboard."""
+    if not _open_clipboard_with_retry():
+        return False
+    try:
+        _EmptyClipboard()
+        data = text + "\x00"
+        blob = data.encode("utf-16-le")
+        handle = _kernel32.GlobalAlloc(_GMEM_MOVEABLE, len(blob))
+        if not handle:
+            return False
+        ptr = _kernel32.GlobalLock(handle)
+        if not ptr:
+            return False
+        try:
+            ctypes.memmove(ptr, blob, len(blob))
+        finally:
+            _kernel32.GlobalUnlock(handle)
+        _SetClipboardData(_CF_UNICODETEXT, handle)
+        return True
+    except Exception:
+        return False
+    finally:
+        _CloseClipboard()
+
+
+def _send_wm_char_sequence(hwnd: int, text: str) -> None:
+    """Deliver `text` one WM_CHAR message at a time.
+
+    Focus-free and IME-free: WM_CHAR is a direct message to the control's
+    window procedure, so it cannot be intercepted by whatever app happens
+    to hold the foreground, and it never passes through an IME. This is
+    exactly what makes it safe for Vietnamese: there is no Telex/Unikey
+    composition step to garble the string.
+    """
+    for ch in text:
+        raw = ch.encode("utf-16-le")
+        for i in range(0, len(raw), 2):
+            unit = int.from_bytes(raw[i:i + 2], "little")
+            _send_msg(hwnd, _WM_CHAR, unit, 0)
+
+
+def _send_em_replacesel(hwnd: int, text: str) -> None:
+    """EM_REPLACESEL — replace the current selection with `text`."""
+    buf = ctypes.create_unicode_buffer(text)
+    _send_msg(hwnd, _EM_REPLACESEL, 1, buf)
+
+
+def _send_wm_paste(hwnd: int, text: str) -> bool:
+    """WM_PASTE via the clipboard, restoring the user's clipboard after.
+
+    Returns False if the clipboard could not be used, so the caller can
+    fall through to another method rather than pretend the paste worked.
+    """
+    saved = _clipboard_read_text()
+    try:
+        if not _clipboard_set_text(text):
+            return False
+        _send_msg(hwnd, _WM_PASTE, 0, 0)
+        return True
+    finally:
+        # Restore unconditionally. `saved is None` means the clipboard held
+        # no text to begin with — we do not invent content, we just leave
+        # the clipboard empty as we found it.
+        try:
+            if saved is not None:
+                _clipboard_set_text(saved)
+            else:
+                if _OpenClipboard(None):
+                    try:
+                        _EmptyClipboard()
+                    finally:
+                        _CloseClipboard()
+        except Exception:
+            pass
+
+
 def _supports_wm_settext(hwnd: int) -> bool:
     """True when the control's class is a plain Win32 text window.
 
-    WM_SETTEXT is honoured by Edit / RichEdit / Static / Window classes.
-    It is NOT honoured by modern XAML/Document controls, which is exactly
-    why we verify the write by reading the value back.
+    P5 Section B1 changed this gate. P4 listed only
+    Edit / RICHEDIT50W / RICHEDIT_CLASS / Static / Window because Windows
+    11 Notepad's `RichEditD2DPT` was believed to reject WM_SETTEXT. That
+    belief was verified WRONG on this machine: a live probe
+    (tests/probe_msg_input_candidates.py) sent WM_SETTEXT to Notepad's
+    RichEditD2DPT control and the read-back matched exactly, Vietnamese
+    round-trip included.
+
+    So `RichEditD2DPT` is now allowed here. Note this gate is only a
+    *pre-filter* for which classes are worth trying — correctness is
+    still decided by `_do_wm_set_text`'s read-back verification, which
+    refuses rather than escalating when a control silently ignores the
+    message. Keeping the read-back is what makes widening this list safe.
     """
     if not hwnd:
         return False
     return _class_of(hwnd) in (
-        "Edit", "RICHEDIT50W", "RICHEDIT_CLASS", "Static", "Window",
+        "Edit", "RICHEDIT50W", "RICHEDIT_CLASS", "RichEditD2DPT",
+        "Static", "Window",
     )
+
+
+# P5 Section B1: classes that accept EM_REPLACESEL / WM_PASTE / WM_CHAR.
+# RichEditD2DPT is Notepad's editor; the RichEdit family takes EM_REPLACESEL.
+_RICHEDIT_CLASSES = frozenset({
+    "RICHEDIT50W", "RICHEDIT_CLASS", "RichEditD2DPT",
+})
 
 
 def _supports_bm_click(hwnd: int) -> bool:
@@ -775,37 +974,54 @@ def _send_unicode_text_guarded(
     ctrl: Optional[uia.Control] = None,
     chunk_chars: int = TYPING_CHUNK_CHARS,
 ) -> int:
-    """Type `text` one guarded chunk at a time.
+    """Type `text`, re-verifying the foreground before EVERY character.
 
-    Before EVERY chunk (≤ `chunk_chars` characters, default 20) the focus
-    is re-verified. The moment it fails we stop and raise FocusGuardAbort
+    P5 B2 tightened this from per-chunk to per-character. The P4 round-1
+    guard checked once per ≤20-character chunk, so a user switching apps
+    *mid-chunk* still had up to 19 characters delivered into the wrong
+    window. Now the check runs before each individual character, so the
+    worst case is a single in-flight character.
+
+    `chunk_chars` is retained to bound how many INPUT structs are built
+    per submission, but it no longer controls the verification
+    granularity — that is now one character.
+
+    The moment verification fails we stop and raise FocusGuardAbort
     carrying the honest count of characters already delivered. We never
     continue typing into a window we can no longer prove is the target.
     """
     typed = 0
     for start in range(0, len(text), chunk_chars):
         piece = text[start:start + chunk_chars]
+        for ch in piece:
+            before = typed
 
-        # Test seam: lets the E2E steal the foreground mid-type.
-        hook = globals().get("_MIDTYPE_INTERRUPT_HOOK")
-        if callable(hook):
-            hook(typed)
+            # Test seam: lets the E2E steal the foreground mid-type.
+            hook = globals().get("_MIDTYPE_INTERRUPT_HOOK")
+            if callable(hook):
+                hook(typed)
 
-        reason = _verify_typing_focus(
-            target_win_hwnd, target_pid, ctrl, chars_typed=typed
-        )
-        if reason is not None:
-            raise FocusGuardAbort(
-                reason, chars_typed=typed, phase="chunk_verify",
+            reason = _verify_typing_focus(
+                target_win_hwnd, target_pid, ctrl, chars_typed=typed
             )
-        try:
-            typed += _send_unicode_text(piece)
-        except Exception as exc:
-            raise FocusGuardAbort(
-                f"SendInput failed after {typed} characters: {exc}",
-                chars_typed=typed, phase="sendinput",
-            ) from exc
-        time.sleep(CHUNK_SETTLE_S)
+            if reason is not None:
+                raise FocusGuardAbort(
+                    reason, chars_typed=typed, phase="char_verify",
+                )
+            try:
+                typed += _send_unicode_text(ch)
+            except Exception as exc:
+                raise FocusGuardAbort(
+                    f"SendInput failed after {typed} characters: {exc}",
+                    chars_typed=typed, phase="sendinput",
+                ) from exc
+            if typed == before:
+                # Defensive: a zero-character send would spin forever.
+                raise FocusGuardAbort(
+                    f"SendInput delivered 0 characters for {ch!r}; aborting",
+                    chars_typed=typed, phase="sendinput",
+                )
+            time.sleep(CHAR_SETTLE_S)
     return typed
 
 
@@ -879,17 +1095,31 @@ def _select_type_method(ctrl: uia.Control) -> str:
     The ladder is ordered strictly by focus impact. SendInput is LAST and
     only reached when no focus-free method is viable for this control.
 
-      1. 'value'  — UIA ValuePattern.SetValue. Works on background windows.
-      2. 'wmtext' — WM_SETTEXT on the control's NativeWindowHandle, then
-                    verified by reading the value back. Also focus-free.
-      3. 'keyboard' — SendInput. Guarded: foreground is verified before
-                    every 20-character chunk and restored afterwards.
+      1. 'value'    — UIA ValuePattern.SetValue. Works on background windows.
+      2. 'wmtext'   — WM_SETTEXT on the control's NativeWindowHandle, then
+                      verified by reading the value back. Also focus-free.
+      3. 'wmchar'   — WM_CHAR message sequence (P5 B1, verified on Notepad).
+      4. 'emreplace'— EM_REPLACESEL (P5 B1, RichEdit family).
+      5. 'wmpaste'  — WM_PASTE with clipboard save+restore (P5 B1).
+      6. 'keyboard' — SendInput. Guarded: foreground is verified before
+                      every single character and restored afterwards (P5 B2).
+
+    Tiers 3-5 were added in P5 after a live probe proved they write into
+    Windows 11 Notepad's RichEditD2DPT control — which the P4 ladder had
+    classified as "no focus-free method", forcing it all the way down to
+    the SendInput tier that caused the round-3 focus incident.
     """
     if _has_writable_value_pattern(ctrl):
         return "value"
-    if _supports_wm_settext(_target_hwnd(ctrl)):
+    hwnd = _target_hwnd(ctrl)
+    if not hwnd:
+        # No native window handle => no message-based method is possible.
+        return "keyboard"
+    if _supports_wm_settext(hwnd):
         return "wmtext"
-    return "keyboard"
+    # P5 B1: any real HWND gets a WM_CHAR attempt before SendInput; the
+    # read-back in _do_type decides whether it actually worked.
+    return "wmchar"
 
 
 def _select_click_method(ctrl: uia.Control) -> str:
@@ -927,6 +1157,9 @@ SENDINPUT_WARNING = (
 METHOD_LABEL = {
     "value": "via ValuePattern",
     "wmtext": "via WM_SETTEXT window message (no focus change)",
+    "wmchar": "via WM_CHAR window messages (no focus change, no IME)",
+    "emreplace": "via EM_REPLACESEL window message (no focus change)",
+    "wmpaste": "via WM_PASTE window message (no focus change; clipboard restored)",
     "keyboard": "via guarded keyboard input into the focused control",
     "invoke": "via UIA Invoke",
     "toggle": "via UIA Toggle",
@@ -940,6 +1173,11 @@ METHOD_LABEL = {
 # focus-free and runs against background windows untouched.
 SENDINPUT_METHODS = frozenset({"keyboard", "coordinate"})
 
+# P5: the message-based character-input tier. All are focus-free, none go
+# through an IME, and all were verified by read-back on real Notepad.
+MESSAGE_METHODS = frozenset({"wmchar", "emreplace", "wmpaste"})
+
+
 # Methods selected from the control's shape without a live desktop probe,
 # exposed so the ladder order is unit-testable without a real UI.
 def type_method_ladder(ctrl: uia.Control) -> List[str]:
@@ -947,8 +1185,15 @@ def type_method_ladder(ctrl: uia.Control) -> List[str]:
     ladder: List[str] = []
     if _has_writable_value_pattern(ctrl):
         ladder.append("value")
-    if _supports_wm_settext(_target_hwnd(ctrl)):
+    hwnd = _target_hwnd(ctrl)
+    if _supports_wm_settext(hwnd):
         ladder.append("wmtext")
+    if hwnd:
+        # P5 B1 — message-based character input, all focus-free.
+        ladder.append("wmchar")
+        if _class_of(hwnd) in _RICHEDIT_CLASSES:
+            ladder.append("emreplace")
+        ladder.append("wmpaste")
     ladder.append("keyboard")
     return ladder
 
@@ -984,6 +1229,23 @@ class ActionConfig:
             "remove account",
         ]
     )
+    # P5 Section C — opt-in, empty by default. A process listed here AND in
+    # allowed_processes may run click_control/type_text in a SINGLE call
+    # with no plan, because the user has already granted standing consent
+    # for that app. Every other gate rule still applies.
+    auto_execute_processes: List[str] = field(default_factory=list)
+
+    def is_auto_executable(self, process_name: str) -> bool:
+        """True when `process_name` may act without a plan.
+
+        Membership in auto_execute_processes is NOT sufficient on its own:
+        the process must still be in allowed_processes, so adding a typo
+        to the auto list cannot accidentally widen the allowlist.
+        """
+        allowed = {nfc_fold(p) for p in self.allowed_processes}
+        auto = {nfc_fold(p) for p in self.auto_execute_processes}
+        key = nfc_fold(process_name)
+        return key in allowed and key in auto
 
     @classmethod
     def load(cls) -> "ActionConfig":
@@ -1008,6 +1270,7 @@ class ActionConfig:
                         "remove account",
                     ],
                 ),
+                auto_execute_processes=raw.get("auto_execute_processes", []),
             )
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             # Create defaults on first run.
@@ -1024,6 +1287,7 @@ class ActionConfig:
                     "enabled": self.enabled,
                     "allowed_processes": self.allowed_processes,
                     "deny_labels": self.deny_labels,
+                    "auto_execute_processes": self.auto_execute_processes,
                 },
                 f,
                 indent=2,
@@ -1073,15 +1337,20 @@ def _build_binding(
     identity or a UIA runtime id, both of which are meaningless in a
     different process.
     """
-    try:
-        hwnd_int = int(hwnd) if hwnd else 0
-    except (TypeError, ValueError):
-        hwnd_int = 0
+    if isinstance(hwnd, str):
+        # run_sequence joins one hwnd per step with "|" — keep it verbatim
+        # so the verifier's recomputed value matches byte-for-byte.
+        hwnd_val: Any = hwnd
+    else:
+        try:
+            hwnd_val = int(hwnd) if hwnd else 0
+        except (TypeError, ValueError):
+            hwnd_val = 0
     return {
         "tool": tool,
         "process": _jval(process_name),
         "window": _jval(window_title),
-        "hwnd": hwnd_int,
+        "hwnd": hwnd_val,
         "control_name": _jval(control_name),
         "control_type": _jval(control_type),
         "automation_id": _jval(automation_id),
@@ -1143,24 +1412,136 @@ def _check_gate(
     if not cfg.enabled:
         return False, "actions are disabled in config/actions.json (enabled=false)"
 
-    # Rule 2: allowlist
-    if process_name.lower() not in [p.lower() for p in cfg.allowed_processes]:
+    # Rule 2: allowlist (case-insensitive, NFC-normalized)
+    allowed_folded = {nfc_fold(p) for p in cfg.allowed_processes}
+    if nfc_fold(process_name) not in allowed_folded:
         return (
             False,
             f"process {process_name!r} is not in allowed_processes "
             f"{cfg.allowed_processes!r}",
         )
 
-    # Rule 3: deny labels
-    name_lower = control_name.lower()
+    # Rule 3: deny labels (case-insensitive, NFC-normalized so a decomposed
+    # control name cannot slip past a deny_label spelled in NFC form)
     for label in cfg.deny_labels:
-        if label.lower() in name_lower:
+        if contains_text(control_name, label):
             return (
                 False,
                 f"control name {control_name!r} contains deny_label {label!r}",
             )
 
     return True, ""
+
+
+# --------------------- P5 C: auto-execute (standing consent) ---------------
+# A process in BOTH allowed_processes and auto_execute_processes has been
+# granted standing consent by the user, so click_control/type_text run in
+# a single call with no plan. The response always carries
+# auto_executed=true so the agent (and the audit log) can tell that no
+# human approved THIS particular action.
+
+
+def _auto_execute_click(
+    ctrl: uia.Control,
+    window_title: str,
+    control_name: str,
+    automation_id_val: str,
+    process_name: str,
+    method: str,
+) -> dict:
+    """Perform a click immediately, without a plan phase."""
+    original_fg = _foreground_hwnd() if method in SENDINPUT_METHODS else 0
+    try:
+        pattern_used = _do_click(ctrl, method=method, restore_foreground=original_fg)
+        _log_event(
+            "execute", "click_control", process_name, window_title,
+            control_name,
+            f"auto_executed=true method={METHOD_LABEL[pattern_used]}",
+        )
+        return {
+            "ok": True,
+            "phase": "execute",
+            "auto_executed": True,
+            "method": pattern_used,
+            "pattern_used": pattern_used,
+            "method_label": METHOD_LABEL[pattern_used],
+            "control_name": control_name,
+            "automation_id": automation_id_val,
+        }
+    except FocusGuardAbort as abort:
+        _log_event(
+            "refuse", "click_control", process_name, window_title,
+            control_name, f"FOCUS_ABORT (phase={abort.phase}): {abort}",
+        )
+        return {
+            "ok": False,
+            "error": "focus_guard_abort",
+            "message": str(abort),
+            "method": method,
+            "method_label": METHOD_LABEL[method],
+            "aborted": True,
+            "clicked": False,
+        }
+    except Exception as exc:
+        _log_event(
+            "refuse", "click_control", process_name, window_title,
+            control_name, f"auto-execute click failed: {exc}",
+        )
+        return {"ok": False, "error": "click_failed", "message": str(exc)}
+
+
+def _auto_execute_type(
+    ctrl: uia.Control,
+    window_title: str,
+    control_name: str,
+    automation_id_val: str,
+    process_name: str,
+    method: str,
+    text: str,
+) -> dict:
+    """Perform a type immediately, without a plan phase."""
+    original_fg = _foreground_hwnd() if method in SENDINPUT_METHODS else 0
+    try:
+        chars = _do_type(ctrl, text, method=method, restore_foreground=original_fg)
+        _log_event(
+            "execute", "type_text", process_name, window_title,
+            control_name,
+            f"auto_executed=true method={METHOD_LABEL[method]} set={text!r}",
+        )
+        return {
+            "ok": True,
+            "phase": "execute",
+            "auto_executed": True,
+            "method": method,
+            "method_label": METHOD_LABEL[method],
+            "chars_typed": chars,
+            "control_name": control_name,
+            "automation_id": automation_id_val,
+            "new_value": text,
+        }
+    except FocusGuardAbort as abort:
+        _log_event(
+            "refuse", "type_text", process_name, window_title,
+            control_name,
+            f"FOCUS_ABORT after {abort.chars_typed} chars "
+            f"(phase={abort.phase}): {abort}",
+        )
+        return {
+            "ok": False,
+            "error": "focus_guard_abort",
+            "message": str(abort),
+            "method": method,
+            "chars_typed": abort.chars_typed,
+            "requested_chars": len(text),
+            "aborted": True,
+            "delivered_to_other_window": False,
+        }
+    except Exception as exc:
+        _log_event(
+            "refuse", "type_text", process_name, window_title,
+            control_name, f"auto-execute type failed: {exc}",
+        )
+        return {"ok": False, "error": "type_failed", "message": str(exc)}
 
 
 # --------------------- control resolution ------------------------------------
@@ -1182,15 +1563,21 @@ def _resolve_control(
 
     window_title = (win.Name or "").strip()
 
-    # Build the search predicate.
+    # Build the search predicate. Vietnamese-safe: automation_id and name
+    # are compared in canonical NFC + case-folded form so a decomposed
+    # control name (combining diacritics) still matches its precomposed
+    # spelling, and casing differences never hide a match.
+    target_aid = nfc_fold(automation_id) if automation_id else ""
+    target_name = nfc_fold(name) if name else ""
+
     def _matches(ctrl: uia.Control) -> bool:
-        if automation_id:
+        if target_aid:
             aid = (ctrl.AutomationId or "").strip()
-            if aid == automation_id:
+            if nfc_fold(aid) == target_aid:
                 return True
-        if name:
+        if target_name:
             nm = (ctrl.Name or "").strip()
-            if nm == name:
+            if nfc_fold(nm) == target_name:
                 return True
         return False
 
@@ -1301,9 +1688,20 @@ def click_control(
 
     # Phase 1: PLAN — no plan_id provided.
     if not plan_id:
-        # Decide HOW the click will be performed, and say so in the plan.
+        # P5 Section C — standing consent. If this process is in
+        # auto_execute_processes (AND allowed_processes) the user has
+        # already granted permission for this app, so the click runs in
+        # ONE call with no plan. Every other gate rule already passed
+        # above, so deny_labels and STOP_ACTIONS still refuse here.
         method = _select_click_method(ctrl)
         label = METHOD_LABEL[method]
+        if _load_config().is_auto_executable(process_name):
+            return _auto_execute_click(
+                ctrl, window_title, control_name, automation_id_val,
+                process_name, method,
+            )
+
+        # Decide HOW the click will be performed, and say so in the plan.
         desc = (
             f"Click {label} in window {window_title!r} — "
             f"control: {control_name!r} "
@@ -1349,13 +1747,16 @@ def click_control(
 
     # Phase 2: EXECUTE — token provided.
     # verify_token checks the HMAC, TTL, consumed-on-disk, and binding.
-    # expected_args carries what we resolved at EXECUTE time. NOTE: we
-    # deliberately bind on the *resolved* window_title (not the raw
-    # `window` argument) because the title is the stable, cross-process
-    # identity of the target; the raw argument may be a fuzzy substring.
+    # expected_args carries what we resolved at EXECUTE time. P5 binds on
+    # TITLE-INDEPENDENT identity (process + hwnd + control identity + args)
+    # rather than the resolved window title — see action_token._build_binding.
+    # The raw `window` may be a fuzzy substring; the resolved title is
+    # recorded only for logging.
     resolved_method = _select_click_method(ctrl)
+    ctrl_hwnd = int(getattr(ctrl, "NativeWindowHandle", 0) or 0)
     expected_args = {
-        "window": window_title,
+        "process": process_name,
+        "hwnd": ctrl_hwnd,
         "automation_id": automation_id_val,
         "name": control_name,
     }
@@ -1508,9 +1909,19 @@ def type_text(
 
     # Phase 1: PLAN.
     if not plan_id:
+        method = _select_type_method(ctrl)
+
+        # P5 Section C — standing consent for auto-executable processes.
+        # The gate above already ran, so STOP_ACTIONS, enabled=false, the
+        # allowlist and deny_labels have all been enforced.
+        if _load_config().is_auto_executable(process_name):
+            return _auto_execute_type(
+                ctrl, window_title, control_name, automation_id_val,
+                process_name, method, text,
+            )
+
         trunc_value = (current_value or "")[:200]
         trunc_text = text[:200]
-        method = _select_type_method(ctrl)
         label = METHOD_LABEL[method]
         if method == "value":
             tail = "(SetValue overwrites the whole value)"
@@ -1519,12 +1930,21 @@ def type_text(
                 "(WM_SETTEXT overwrites the whole value; the target window "
                 "stays in the background — no focus change)"
             )
+        elif method in MESSAGE_METHODS:
+            # P5 B1: every one of these clears the control first, so the
+            # whole value IS replaced — say so plainly, because the user
+            # is approving an overwrite.
+            tail = (
+                "(this method replaces the whole text; the target window "
+                "stays in the background — no focus change, no IME)"
+            )
         else:
             tail = (
-                "(no focus-free method is viable for this control; it will be "
-                "brought to the front and the text typed into it at the "
-                "caret, so existing text is NOT cleared. Typing is verified "
-                "before every 20 characters and aborts if focus moves away.)"
+                "(no focus-free method is viable for this control; the target "
+                "window must ALREADY be in front, otherwise the action aborts "
+                "without typing anything. The text is typed at the caret, so "
+                "existing text is NOT cleared. Focus is verified before every "
+                "single character and typing stops the moment focus moves.)"
             )
         desc = (
             f"Set text {label} of [{control_name!r}] in window "
@@ -1568,8 +1988,12 @@ def type_text(
 
     # Phase 2: EXECUTE — token provided.
     resolved_method = _select_type_method(ctrl)
+    ctrl_hwnd = int(getattr(ctrl, "NativeWindowHandle", 0) or 0)
+    # P5: bind on title-INDEPENDENT identity (process + hwnd + control
+    # identity + args_hash) — see server/action_token._build_binding.
     expected_args = {
-        "window": window_title,
+        "process": process_name,
+        "hwnd": ctrl_hwnd,
         "automation_id": automation_id_val,
         "name": control_name,
         "text": text,
@@ -1885,6 +2309,51 @@ def _do_wm_set_text(ctrl: uia.Control, text: str) -> int:
     return len(text)
 
 
+def _do_message_type(ctrl: uia.Control, text: str, method: str) -> int:
+    """Write `text` with a focus-free window message, then VERIFY it.
+
+    P5 B1. Every one of these methods writes to the control's HWND
+    directly, so the foreground window is never touched and no IME can
+    garble composed Vietnamese. Each is verified by reading the control's
+    text back; a mismatch RAISES rather than escalating, because silently
+    falling through to SendInput would reintroduce the focus hazard this
+    tier exists to avoid.
+    """
+    hwnd = _target_hwnd(ctrl)
+    if not hwnd:
+        raise RuntimeError(
+            f"control {ctrl.Name!r} has no NativeWindowHandle; "
+            f"{method} cannot be used"
+        )
+
+    # Start from a known-empty control so the read-back proves OUR write
+    # and not leftover text that happened to match.
+    _wm_set_text(hwnd, "")
+    time.sleep(0.02)
+
+    if method == "wmchar":
+        _send_wm_char_sequence(hwnd, text)
+    elif method == "emreplace":
+        _send_em_replacesel(hwnd, text)
+    elif method == "wmpaste":
+        if not _send_wm_paste(hwnd, text):
+            raise RuntimeError(
+                f"WM_PASTE could not use the clipboard for hwnd={hwnd}"
+            )
+    else:
+        raise RuntimeError(f"unknown message type method {method!r}")
+
+    time.sleep(0.08)
+    readback = _wm_get_text(hwnd)
+    if readback != text:
+        raise RuntimeError(
+            f"{method} verification failed: wrote {text!r} to hwnd={hwnd} "
+            f"but reading it back returned {readback!r}. "
+            f"Refusing to escalate to keyboard input."
+        )
+    return len(text)
+
+
 def _do_type(
     ctrl: uia.Control,
     text: str,
@@ -1906,20 +2375,34 @@ def _do_type(
         # Focus-free tier: WM_SETTEXT straight at the control's HWND.
         return _do_wm_set_text(ctrl, text)
 
+    if method in MESSAGE_METHODS:
+        # P5 B1 focus-free tier: WM_CHAR / EM_REPLACESEL / WM_PASTE.
+        return _do_message_type(ctrl, text, method)
+
     if method == "keyboard":
-        # Guarded last resort. Focus the target, VERIFY the OS agrees, then
-        # type in ≤20-character chunks re-verifying before every chunk.
+        # Guarded last resort — and now genuinely last: P5 B1 added the
+        # focus-free message tier above, so SendInput is only reached when
+        # the control has no usable HWND at all.
+        #
+        # P5 B2: do NOT steal the foreground. If the target is not already
+        # the foreground window we abort with a specific error instead of
+        # calling SetForegroundWindow and racing the user's own typing.
         target_win = _target_window_hwnd(ctrl)
         target_pid = _pid_of(target_win) or _pid_of(_target_hwnd(ctrl))
+
+        reason = _verify_typing_focus(target_win, target_pid, ctrl, 0)
+        if reason is not None:
+            raise FocusGuardAbort(
+                f"the target window is not the foreground window, so typing "
+                f"into it would require stealing focus from whatever the user "
+                f"is using right now: {reason}. Bring the target window to "
+                f"the front yourself (or call focus_window first) and retry. "
+                f"Nothing was typed.",
+                chars_typed=0, phase="preflight",
+            )
+        _uia_set_focus(ctrl)
+        time.sleep(0.1)
         try:
-            if target_win:
-                _force_foreground(target_win)
-                time.sleep(0.1)
-            _uia_set_focus(ctrl)
-            time.sleep(0.15)  # let the provider move focus before we type
-            reason = _verify_typing_focus(target_win, target_pid, ctrl, 0)
-            if reason is not None:
-                raise FocusGuardAbort(reason, chars_typed=0, phase="preflight")
             return _send_unicode_text_guarded(
                 text, target_win, target_pid, ctrl=ctrl
             )
@@ -1930,3 +2413,414 @@ def _do_type(
     raise RuntimeError(
         f"control {ctrl.Name!r} has unknown type method {method!r}"
     )
+
+
+# ===================== P5 C: run_sequence ===================================
+#
+# The approval-spam problem: opening Notepad, opening a tab and typing took
+# the user 10+ separate confirmations. `run_sequence` collapses ONE task
+# into ONE plan covering an ordered list of steps.
+#
+# Design rules that keep this safe:
+#   * ONE token covers the whole sequence, and its binding is a hash over
+#     the canonical step list PLUS each step's resolved target and method.
+#     Tampering with any step (reordering, changing the text, pointing at a
+#     different control) invalidates the token.
+#   * At execute, gate rules are RE-CHECKED PER STEP — a config change
+#     between plan and execute refuses the sequence.
+#   * The first failing step ABORTS the sequence. Remaining steps are
+#     reported as "skipped"; we never silently continue.
+#   * If EVERY step targets an auto-executable process, the sequence runs
+#     directly with no plan at all (auto_executed=true).
+
+MAX_SEQUENCE_STEPS = 10
+SEQUENCE_ACTIONS = ("focus_window", "click_control", "type_text")
+
+
+def _normalize_step(index: int, raw: Any) -> dict:
+    """Validate one sequence step and return its canonical form.
+
+    Raises ValueError with a precise message when the step is malformed,
+    so the caller can report exactly which step number is wrong.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(f"step {index}: must be an object, got {type(raw).__name__}")
+
+    action = raw.get("action") or raw.get("tool")
+    if action not in SEQUENCE_ACTIONS:
+        raise ValueError(
+            f"step {index}: action must be one of {list(SEQUENCE_ACTIONS)}, "
+            f"got {action!r}"
+        )
+
+    window = raw.get("window")
+    if not isinstance(window, str) or not window.strip():
+        raise ValueError(f"step {index}: 'window' is required and must be a string")
+
+    step: Dict[str, Any] = {
+        "action": action,
+        "window": nfc(window.strip()),
+    }
+    if action == "type_text":
+        text = raw.get("text")
+        if not isinstance(text, str):
+            raise ValueError(
+                f"step {index}: type_text requires a string 'text'"
+            )
+        step["text"] = text
+        step["automation_id"] = raw.get("automation_id") or ""
+        step["name"] = raw.get("name") or ""
+    elif action == "click_control":
+        automation_id = raw.get("automation_id") or ""
+        name = raw.get("name") or ""
+        if not automation_id and not name:
+            raise ValueError(
+                f"step {index}: click_control requires 'automation_id' "
+                f"and/or 'name'"
+            )
+        step["automation_id"] = nfc_fold(automation_id) if automation_id else ""
+        step["name"] = nfc_fold(name) if name else ""
+    return step
+
+
+def _canonical_steps(steps: List[Any]) -> List[dict]:
+    """Validate + canonicalize a whole step list."""
+    if not isinstance(steps, list) or not steps:
+        raise ValueError("'steps' must be a non-empty list")
+    if len(steps) > MAX_SEQUENCE_STEPS:
+        raise ValueError(
+            f"sequence has {len(steps)} steps; the maximum is "
+            f"{MAX_SEQUENCE_STEPS}"
+        )
+    return [_normalize_step(i, s) for i, s in enumerate(steps, start=1)]
+
+
+def _sequence_binding(steps: List[dict], resolved: List[dict]) -> str:
+    """Hash binding a sequence token to its steps AND their resolved targets.
+
+    `resolved` carries, per step, the window title / control identity /
+    method that PLAN actually resolved. Including it means the token is
+    bound to what will REALLY happen, not merely to what was requested —
+    so a control that resolves differently at execute time is caught.
+
+    NOTE: the token module re-hashes whatever lands in `args_hash` when it
+    verifies, so this digest is what we hand it as the `steps_hash` arg —
+    both sides then compute the identical value.
+    """
+    payload = {
+        "steps": steps,
+        "resolved": resolved,
+    }
+    return _tok._hash_args(payload)
+
+
+def _describe_sequence(steps: List[dict], resolved: List[dict]) -> str:
+    """One human-readable block describing the whole sequence."""
+    lines = [f"Run a {len(steps)}-step sequence:"]
+    for i, (step, res) in enumerate(zip(steps, resolved), start=1):
+        if step["action"] == "focus_window":
+            lines.append(
+                f"  {i}. focus window {res.get('window_title', step['window'])!r}"
+            )
+        elif step["action"] == "click_control":
+            lines.append(
+                f"  {i}. click {res.get('control_name')!r} "
+                f"{METHOD_LABEL.get(res.get('method'), '')} in window "
+                f"{res.get('window_title', step['window'])!r}"
+            )
+        else:
+            text = step["text"]
+            shown = text if len(text) <= 120 else text[:120] + "…"
+            lines.append(
+                f"  {i}. type into {res.get('control_name')!r} "
+                f"{METHOD_LABEL.get(res.get('method'), '')} in window "
+                f"{res.get('window_title', step['window'])!r}: {shown!r}"
+            )
+    if any(res.get("method") in SENDINPUT_METHODS for res in resolved):
+        lines.append(SENDINPUT_WARNING.strip())
+    return "\n".join(lines)
+
+
+def _resolve_sequence_steps(steps: List[dict]) -> tuple[List[dict], str]:
+    """Resolve every step and gate-check it. Returns (resolved, error).
+
+    Any failure returns a structured error string; the caller refuses the
+    whole sequence rather than planning a partial one.
+    """
+    _ui_mod.init()
+    resolved: List[dict] = []
+    for i, step in enumerate(steps, start=1):
+        action = step["action"]
+        window = step["window"]
+
+        if action == "focus_window":
+            win = _ui_mod.find_window(window)
+            if not win:
+                return [], f"step {i}: window not found: {window!r}"
+            title = (win.Name or "").strip()
+            process = _process_name_from_window(window)
+            allowed, reason = _check_gate("focus_window", process, title, "")
+            if not allowed:
+                return [], f"step {i}: {reason}"
+            resolved.append(
+                {
+                    "action": action,
+                    "window_title": title,
+                    "process": process,
+                    "control_name": "",
+                    "method": "focus",
+                    "hwnd": int(getattr(win, "NativeWindowHandle", 0) or 0),
+                }
+            )
+            continue
+
+        ctrl, title = _resolve_control(
+            window, step.get("automation_id") or None, step.get("name") or None
+        )
+        if ctrl is None:
+            return [], f"step {i}: {title}"
+
+        control_name = (ctrl.Name or "").strip()
+        automation_id_val = (ctrl.AutomationId or "").strip()
+        process = _process_name_from_window(window)
+        allowed, reason = _check_gate(action, process, title, control_name)
+        if not allowed:
+            return [], f"step {i}: {reason}"
+
+        method = (
+            _select_type_method(ctrl)
+            if action == "type_text"
+            else _select_click_method(ctrl)
+        )
+        resolved.append(
+            {
+                "action": action,
+                "window_title": title,
+                "process": process,
+                "control_name": control_name,
+                "automation_id": automation_id_val,
+                "control_type": getattr(ctrl, "ControlTypeName", ""),
+                "hwnd": int(getattr(ctrl, "NativeWindowHandle", 0) or 0),
+                "method": method,
+            }
+        )
+    return resolved, ""
+
+
+def run_sequence(steps: List[Any], plan_id: Optional[str] = None) -> dict:
+    """Run an ordered list of actions under ONE approval.
+
+    Two-phase, like click_control/type_text, but ONE plan covers the whole
+    sequence:
+      - called without plan_id -> validate every step, return a plan whose
+        token is bound to the canonical step list AND each step's resolved
+        target and method.
+      - called with plan_id -> re-resolve, re-check the gate PER STEP, run
+        the steps in order, and STOP at the first failure (later steps are
+        reported "skipped").
+
+    If every step targets an auto-executable process, the sequence runs
+    directly with auto_executed=true and no plan.
+    """
+    _ui_mod.init()
+
+    try:
+        canon_steps = _canonical_steps(steps)
+    except ValueError as exc:
+        return {"ok": False, "error": "invalid_sequence", "message": str(exc)}
+
+    # Resolve + gate-check every step up front. A sequence that cannot be
+    # fully planned is never planned at all.
+    resolved, error = _resolve_sequence_steps(canon_steps)
+    if error:
+        _log_event("refuse", "run_sequence", "", "", "", error)
+        return {"ok": False, "error": "sequence_refused", "message": error}
+
+    # ---- Auto-execute: every step's process is auto-executable -----------
+    cfg = _load_config()
+    if all(cfg.is_auto_executable(r.get("process", "")) for r in resolved):
+        return _execute_sequence(
+            canon_steps, resolved, plan_id=None, auto=True
+        )
+
+    # ---- Phase 1: PLAN ---------------------------------------------------
+    if not plan_id:
+        steps_digest = _sequence_binding(canon_steps, resolved)
+        binding = _build_binding(
+            tool="run_sequence",
+            # P5 title-independent identity. These joined values are
+            # byte-identical on both the PLAN and the EXECUTE side, so
+            # the verifier's recomputed binding matches.
+            process_name=" | ".join(
+                r.get("process", "") for r in resolved
+            ),
+            window_title=" | ".join(
+                r.get("window_title", "") for r in resolved
+            ),
+            control_name="|".join(
+                r.get("control_name", "") for r in resolved
+            ),
+            control_type="sequence",
+            automation_id="|".join(
+                r.get("automation_id", "") for r in resolved
+            ),
+            hwnd="|".join(str(int(r.get("hwnd") or 0)) for r in resolved),
+            # The token module re-hashes args_hash on verification, so we
+            # must store the *same* wrapping it will compute at execute.
+            args_hash=_tok._hash_args({"steps_hash": steps_digest}),
+        )
+        token = _tok.issue_token(
+            tool="run_sequence", method="sequence", binding=binding
+        )
+        desc = _describe_sequence(canon_steps, resolved)
+        plan_id_out = _tok.decode_token(token)["plan_id"]
+        _log_event(
+            "plan", "run_sequence", "", desc.splitlines()[0] if desc else "",
+            f"{len(canon_steps)} steps", f"plan_id={plan_id_out}",
+        )
+        return {
+            "ok": True,
+            "phase": "plan",
+            "plan_id": token,
+            "description": desc,
+            "expires_in_s": PLAN_TTL_SECONDS,
+            "steps": len(canon_steps),
+        }
+
+    # ---- Phase 2: EXECUTE ------------------------------------------------
+    # P5: bind on title-INDEPENDENT identity (process + hwnd per step,
+    # plus the canonical sequence digest) — see action_token._build_binding.
+    expected_args = {
+        "process": " | ".join(
+            r.get("process", "") for r in resolved
+        ),
+        "hwnd": "|".join(
+            str(int(r.get("hwnd") or 0)) for r in resolved
+        ),
+        "automation_id": "|".join(
+            r.get("automation_id", "") for r in resolved
+        ),
+        "name": "|".join(
+            r.get("control_name", "") for r in resolved
+        ),
+        "steps_hash": _sequence_binding(canon_steps, resolved),
+    }
+    vr = _tok.verify_token(plan_id, expected_args)
+    if not vr.ok:
+        _log_event(
+            "refuse", "run_sequence", "", "", "",
+            f"token={vr.reason}: {vr.message}",
+        )
+        return {
+            "ok": False,
+            "error": vr.reason,
+            "message": vr.message,
+            "plan_id": plan_id,
+        }
+
+    return _execute_sequence(canon_steps, resolved, plan_id=plan_id, auto=False)
+
+
+def _execute_sequence(
+    steps: List[dict],
+    resolved: List[dict],
+    plan_id: Optional[str],
+    auto: bool,
+) -> dict:
+    """Run the steps in order; stop at the first failure.
+
+    Per-step status is reported as "done" / "failed" / "skipped" so the
+    caller always knows exactly how far the sequence got.
+    """
+    statuses: List[dict] = []
+    aborted = False
+    failure: Optional[dict] = None
+
+    for i, (step, res) in enumerate(zip(steps, resolved), start=1):
+        if aborted:
+            statuses.append({"step": i, "action": step["action"], "status": "skipped"})
+            continue
+
+        action = step["action"]
+        window = step["window"]
+        process = res.get("process", "")
+
+        try:
+            if action == "focus_window":
+                out = focus_window(window)
+            elif action == "click_control":
+                out = click_control(
+                    window,
+                    automation_id=step.get("automation_id") or None,
+                    name=step.get("name") or None,
+                    _resolved_ctrl=None,
+                )
+            else:
+                out = type_text(
+                    window,
+                    step["text"],
+                    automation_id=step.get("automation_id") or None,
+                    name=step.get("name") or None,
+                )
+        except Exception as exc:  # defensive: never crash the server
+            out = {"ok": False, "error": "step_exception", "message": str(exc)}
+
+        if out.get("ok"):
+            statuses.append(
+                {
+                    "step": i,
+                    "action": action,
+                    "status": "done",
+                    "method": out.get("method"),
+                }
+            )
+            _log_event(
+                "execute", f"run_sequence.{action}", process,
+                res.get("window_title", ""), res.get("control_name", ""),
+                f"step {i}/{len(steps)} ok"
+                + (" (auto_executed)" if auto else ""),
+            )
+            continue
+
+        # First failure stops everything.
+        aborted = True
+        failure = {
+            "step": i,
+            "action": action,
+            "error": out.get("error"),
+            "message": out.get("message"),
+        }
+        statuses.append(
+            {
+                "step": i,
+                "action": action,
+                "status": "failed",
+                "error": out.get("error"),
+                "message": out.get("message"),
+            }
+        )
+        _log_event(
+            "refuse", f"run_sequence.{action}", process,
+            res.get("window_title", ""), res.get("control_name", ""),
+            f"step {i}/{len(steps)} FAILED: {out.get('error')}: {out.get('message')}",
+        )
+
+    done = sum(1 for s in statuses if s["status"] == "done")
+    result: Dict[str, Any] = {
+        "ok": not aborted,
+        "phase": "execute",
+        "auto_executed": auto,
+        "steps": statuses,
+        "completed": done,
+        "total": len(steps),
+    }
+    if aborted and failure:
+        result["error"] = "sequence_aborted"
+        result["failed_step"] = failure
+        result["message"] = (
+            f"sequence aborted at step {failure['step']} of {len(steps)} "
+            f"({failure['action']}): {failure['error']} — "
+            f"{failure['message']}. Steps {failure['step'] + 1}-"
+            f"{len(steps)} were NOT run."
+        )
+    return result

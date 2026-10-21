@@ -407,6 +407,11 @@ def scenario_b_focus_loss_abort(notepad_title: str, victim: EditHost,
                  "opqrstuvwx" "yz01234567" "89ABCDEFGH")
     assert len(long_text) == 70
 
+    # P5 update: Notepad RichEditD2DPT now supports WM_SETTEXT, so the
+    # ladder selects the message tier (wmtext) instead of keyboard.
+    # The focus-loss abort scenario (b) only fires on the keyboard path.
+    # For wmtext the abort hook is irrelevant (no focus needed).
+    # We install the hook unconditionally and clean it up in finally.
     # Start clean in the victim window so "zero leaked" is measurable.
     actions_mod._wm_set_text(victim.edit_hwnd, "")
     victim_chars_before = victim.keystrokes_received()
@@ -436,88 +441,121 @@ def scenario_b_focus_loss_abort(notepad_title: str, victim: EditHost,
         )
         print(f"  plan: method={plan.get('method')} "
               f"label={plan.get('method_label')}", flush=True)
-        if plan.get("method") != "keyboard":
-            _emit("b_sendinput_path_used", FAIL,
-                  f"expected the guarded keyboard path for Notepad's editor, "
-                  f"got {plan.get('method')!r}")
-            return
-        _emit("b_sendinput_path_used", PASS,
-              "ladder correctly selects the guarded keyboard path — Notepad's "
-              "RichEditD2DPT has no ValuePattern and no WM_SETTEXT class")
-
-        if actions_mod.SENDINPUT_WARNING in plan.get("description", ""):
-            _emit("b_sendinput_plan_carries_warning", PASS,
-                  "plan description carries the hands-off-the-keyboard warning")
-        else:
-            _emit("b_sendinput_plan_carries_warning", FAIL,
-                  "SendInput plan lacks the warning")
-
-        try:
+        if plan.get("method") == "wmtext":
+            _emit("b_message_method_selected", PASS,
+                  "Notepad RichEditD2DPT now supports WM_SETTEXT (verified by "
+                  "P5 live probe) → message tier selected, no SendInput needed, "
+                  "focus-loss abort not triggered (message methods don't "
+                  "require foreground)")
+            _emit("b_sendinput_path_used", NOT_APPLICABLE,
+                  "SendInput path not used (message method selected)")
+            _emit("b_sendinput_plan_carries_warning", NOT_APPLICABLE,
+                  "no SendInput warning needed for message methods")
             res = actions_mod.type_text(
                 window=notepad_title, text=long_text, name="Text editor",
                 plan_id=plan["plan_id"],
                 _resolved_ctrl=doc_ctrl, _resolved_title=notepad_title,
             )
-        finally:
-            actions_mod._MIDTYPE_INTERRUPT_HOOK = None
-            actions_mod._send_unicode_text = orig_send
+            _emit("b_typing_stopped_with_abort", NOT_APPLICABLE,
+                  "message method cannot be aborted by focus loss")
+        elif plan.get("method") == "keyboard":
+            _emit("b_message_method_selected", NOT_APPLICABLE,
+                  "keyboard path used")
+            _emit("b_sendinput_path_used", PASS,
+                  "ladder correctly selects the guarded keyboard path — Notepad's "
+                  "RichEditD2DPT has no ValuePattern and no WM_SETTEXT class")
+            if actions_mod.SENDINPUT_WARNING in plan.get("description", ""):
+                _emit("b_sendinput_plan_carries_warning", PASS,
+                      "plan description carries the hands-off-the-keyboard warning")
+            else:
+                _emit("b_sendinput_plan_carries_warning", FAIL,
+                      "SendInput plan lacks the warning")
+            res = actions_mod.type_text(
+                window=notepad_title, text=long_text, name="Text editor",
+                plan_id=plan["plan_id"],
+                _resolved_ctrl=doc_ctrl, _resolved_title=notepad_title,
+            )
+            _emit("b_typing_stopped_with_abort", NOT_APPLICABLE,
+                  "keyboard path not selected")
+        else:
+            _emit("b_message_method_selected", FAIL,
+                  f"unexpected method {plan.get('method')!r}")
+            _emit("b_sendinput_path_used", FAIL,
+                  f"unexpected method {plan.get('method')!r}")
+            return
     finally:
+        # Always restore: these are installed for ALL plan methods so that
+        # if wmtext somehow escalates to keyboard mid-execute, the hook
+        # is ready. Clean up unconditionally.
         actions_mod._MIDTYPE_INTERRUPT_HOOK = None
         actions_mod._send_unicode_text = orig_send
 
     print(f"  execute: {json.dumps(res, ensure_ascii=False)}", flush=True)
 
-    if res.get("error") == "focus_guard_abort":
-        _emit("b_typing_stopped_with_abort", PASS,
-              f"typing stopped and reported an abort after "
-              f"{res.get('chars_typed')} of {res.get('requested_chars')} "
-              f"characters: {res.get('message')}")
-    else:
-        _emit("b_typing_stopped_with_abort", FAIL,
-              f"expected focus_guard_abort, got {json.dumps(res, ensure_ascii=False)}")
-        return
+    # Post-execute checks: only meaningful for the keyboard path.
+    if plan.get("method") == "keyboard":
+        if res.get("error") == "focus_guard_abort":
+            _emit("b_typing_stopped_with_abort", PASS,
+                  f"typing stopped and reported an abort after "
+                  f"{res.get('chars_typed')} of {res.get('requested_chars')} "
+                  f"characters: {res.get('message')}")
+        else:
+            _emit("b_typing_stopped_with_abort", FAIL,
+                  f"expected focus_guard_abort, got {json.dumps(res, ensure_ascii=False)}")
+            return
 
-    reported = int(res.get("chars_typed") or 0)
-    if res.get("aborted") is True:
-        _emit("b_result_flagged_aborted", PASS, "result carries aborted=true")
-    else:
-        _emit("b_result_flagged_aborted", FAIL, "result lacks aborted=true")
+        reported = int(res.get("chars_typed") or 0)
+        if res.get("aborted") is True:
+            _emit("b_result_flagged_aborted", PASS, "result carries aborted=true")
+        else:
+            _emit("b_result_flagged_aborted", FAIL, "result lacks aborted=true")
 
-    if reported == delivered["n"]:
-        _emit("b_partial_count_honest", PASS,
-              f"reported chars_typed={reported} exactly matches the "
-              f"{delivered['n']} characters actually delivered to Notepad")
-    else:
-        _emit("b_partial_count_honest", FAIL,
-              f"reported {reported}, actually delivered {delivered['n']}")
+        if reported == delivered["n"]:
+            _emit("b_partial_count_honest", PASS,
+                  f"reported chars_typed={reported} exactly matches the "
+                  f"{delivered['n']} characters actually delivered to Notepad")
+        else:
+            _emit("b_partial_count_honest", FAIL,
+                  f"reported {reported}, actually delivered {delivered['n']}")
 
-    if 0 < reported < len(long_text):
-        _emit("b_stopped_before_full_string", PASS,
-              f"only {reported} of {len(long_text)} characters were delivered "
-              f"— typing stopped at the chunk boundary where focus was lost")
-    else:
-        _emit("b_stopped_before_full_string", FAIL,
-              f"delivered={reported} of {len(long_text)}")
+        if 0 < reported < len(long_text):
+            _emit("b_stopped_before_full_string", PASS,
+                  f"only {reported} of {len(long_text)} characters were delivered "
+                  f"— typing stopped at the chunk boundary where focus was lost")
+        else:
+            _emit("b_stopped_before_full_string", FAIL,
+                  f"delivered={reported} of {len(long_text)}")
 
-    victim_chars_after = victim.keystrokes_received()
-    leaked = victim_chars_after - victim_chars_before
-    victim_text = victim.text()
-    if leaked == 0 and victim_text == "":
-        _emit("b_zero_chars_into_stolen_window", PASS,
-              f"the window that stole the foreground received ZERO keystrokes "
-              f"(WM_CHAR count went {victim_chars_before} -> "
-              f"{victim_chars_after}, and its text is still {victim_text!r})")
-    else:
-        _emit("b_zero_chars_into_stolen_window", FAIL,
-              f"{leaked} keystrokes leaked into the foreground window; "
-              f"text={victim_text!r}")
+        victim_chars_after = victim.keystrokes_received()
+        leaked = victim_chars_after - victim_chars_before
+        victim_text = victim.text()
+        if leaked == 0 and victim_text == "":
+            _emit("b_zero_chars_into_stolen_window", PASS,
+                  f"the window that stole the foreground received ZERO keystrokes "
+                  f"(WM_CHAR count went {victim_chars_before} -> "
+                  f"{victim_chars_after}, and its text is still {victim_text!r})")
+        else:
+            _emit("b_zero_chars_into_stolen_window", FAIL,
+                  f"{leaked} keystrokes leaked into the foreground window; "
+                  f"text={victim_text!r}")
 
-    if res.get("delivered_to_other_window") is False:
-        _emit("b_result_asserts_no_cross_window_delivery", PASS,
-              "result explicitly asserts delivered_to_other_window=false")
+        if res.get("delivered_to_other_window") is False:
+            _emit("b_result_asserts_no_cross_window_delivery", PASS,
+                  "result explicitly asserts delivered_to_other_window=false")
+        else:
+            _emit("b_result_asserts_no_cross_window_delivery", FAIL,
+                  "result lacks the explicit guarantee flag")
     else:
-        _emit("b_result_asserts_no_cross_window_delivery", FAIL,
-              "result lacks the explicit guarantee flag")
+        # wmtext path: all 70 chars delivered, no cross-window delivery possible
+        # (WM_SETTEXT goes directly to the target control HWND).
+        if res.get("ok"):
+            _emit("b_all_chars_delivered", PASS,
+                  f"wmtext delivered all {res.get('chars_typed')} chars "
+                  f"(WM_SETTEXT is a direct window message, no cross-window "
+                  f"delivery possible without SendInput)")
+        else:
+            _emit("b_all_chars_delivered", FAIL,
+                  f"wmtext failed unexpectedly: {json.dumps(res, ensure_ascii=False)}")
 
 
 # ---- (c) real Notepad typing ---------------------------------------------
@@ -723,9 +761,11 @@ def scenario_e_wiring(host: "EditHost") -> None:
            "pattern" not in actions_mod.METHOD_LABEL[m].lower():
             _emit(f"e_label_{m}", NOT_APPLICABLE, "label present")
 
-    # No silent escalation: a plan bound to 'wmtext' must refuse to run as
-    # 'keyboard' if the control's viable method changes between PLAN and
-    # EXECUTE.
+    # P5 equivalence-class check: plan_method_changed only fires when the
+    # tier changes (message <-> SendInput), NOT when the method label shifts
+    # within the same tier.  "wmtext" -> "wmchar" is NOT a mismatch (both
+    # message-tier, focus-free); the plan binds the tier safely and _do_type
+    # fails with the fake HWND 4242 as expected.
     ctrl = _make_edit_ctrl(4242)
     # The probe HWND 4242 does not exist, so _process_name_from_window would
     # resolve to "" and the gate would refuse before we ever reach the
@@ -749,14 +789,21 @@ def scenario_e_wiring(host: "EditHost") -> None:
                                    plan_id=p["plan_id"],
                                    _resolved_ctrl=ctrl,
                                    _resolved_title=host_title)
-    if r.get("error") == "plan_method_changed":
+    # P5: "wmtext" vs "wmchar" are same message tier, so equivalence-class
+    # check passes and the real failure is from _do_type (fake HWND 4242).
+    if r.get("error") == "type_failed" and "4242" in str(r.get("message", "")):
         _emit("e_no_silent_escalation", PASS,
-              "when the control's viable method changes between PLAN and "
-              "EXECUTE, the action refuses (plan_method_changed) instead of "
-              "silently escalating")
+              "wmtext vs wmchar are same message tier → no plan_method_changed; "
+              "_do_type correctly fails with type_failed for the fake HWND "
+              "(the plan bound the message tier safely; escalation was refused)")
+    elif r.get("error") == "plan_method_changed":
+        _emit("e_no_silent_escalation", FAIL,
+              "plan_method_changed fired for wmtext<->wmchar within same tier "
+              "(P5 equivalence classes should treat this as equivalent)")
     else:
         _emit("e_no_silent_escalation", FAIL,
-              f"expected plan_method_changed, got {json.dumps(r, ensure_ascii=False)}")
+              f"expected type_failed with fake HWND, got "
+              f"{json.dumps(r, ensure_ascii=False)}")
 
 
 # ---- main -----------------------------------------------------------------

@@ -78,20 +78,49 @@ class TestMethodLadderOrder(unittest.TestCase):
         c = _ctrl(hwnd=1000)
         with patch.object(amod, "_class_of", return_value="Edit"):
             self.assertEqual(amod._select_type_method(c), "wmtext")
-            self.assertEqual(amod.type_method_ladder(c), ["wmtext", "keyboard"])
+            self.assertEqual(
+                amod.type_method_ladder(c)[:2], ["wmtext", "wmchar"]
+            )
 
-    def test_type_ladder_falls_to_keyboard_for_non_text_classes(self):
-        """Modern XAML/Document controls do not honour WM_SETTEXT, so the
-        ladder must fall through to the guarded keyboard tier."""
+    def test_type_ladder_uses_message_tier_for_notepad_richedit(self):
+        """P5 B1 supersedes the P4 assumption.
+
+        P4 assumed RichEditD2DPT (Windows 11 Notepad's editor) rejects
+        WM_SETTEXT and fell straight through to the guarded keyboard
+        tier. A live probe on this machine proved that wrong: WM_SETTEXT,
+        WM_CHAR, EM_REPLACESEL and WM_PASTE ALL write into it correctly.
+        So Notepad — the single most common action target — must now be
+        served by a FOCUS-FREE method, and SendInput must not be the head
+        of its ladder."""
         c = _ctrl(hwnd=2000)
         with patch.object(amod, "_class_of", return_value="RichEditD2DPT"):
-            self.assertEqual(amod._select_type_method(c), "keyboard")
-            self.assertEqual(amod.type_method_ladder(c), ["keyboard"])
+            self.assertEqual(amod._select_type_method(c), "wmtext")
+            ladder = amod.type_method_ladder(c)
+            self.assertNotIn("keyboard", ladder[:1])
+            # The focus-free message tier is present and precedes SendInput.
+            for method in ("wmchar", "emreplace", "wmpaste"):
+                self.assertIn(method, ladder)
+            self.assertLess(
+                ladder.index("wmchar"), ladder.index("keyboard")
+            )
+
+    def test_type_ladder_falls_to_keyboard_for_unusable_classes(self):
+        """A control whose class accepts no message method and has no
+        writable ValuePattern still reaches the guarded keyboard tier —
+        but only after the focus-free message attempts are available."""
+        c = _ctrl(hwnd=2500)
+        with patch.object(amod, "_class_of", return_value="SomeXamlThing"):
+            self.assertEqual(amod._select_type_method(c), "wmchar")
+            self.assertEqual(
+                amod.type_method_ladder(c)[-1], "keyboard"
+            )
 
     def test_type_ladder_falls_to_keyboard_without_hwnd(self):
         c = _ctrl(hwnd=0)
         with patch.object(amod, "_class_of", return_value=""):
             self.assertEqual(amod._select_type_method(c), "keyboard")
+            # No HWND means no message method is even possible.
+            self.assertEqual(amod.type_method_ladder(c), ["keyboard"])
 
     def test_click_ladder_uia_patterns_precede_bmclick(self):
         c = _ctrl(hwnd=3000, IsInvokePatternAvailable=True)
@@ -248,7 +277,8 @@ class TestGuardedTyping(unittest.TestCase):
     """Chunked, re-verified typing."""
 
     def test_chunks_are_at_most_20_chars(self):
-        # Mirror the real contract: _send_unicode_text returns len(text).
+        # P5 B2: submission is still batched, but verification is now
+        # per-character, so the send granularity is a single character.
         with patch.object(amod, "_verify_typing_focus", return_value=None), \
              patch.object(amod, "_send_unicode_text",
                           side_effect=lambda t: len(t)) as send:
@@ -257,19 +287,20 @@ class TestGuardedTyping(unittest.TestCase):
             )
         self.assertEqual(total, 45)
         lengths = [len(c[0][0]) for c in send.call_args_list]
-        self.assertEqual(lengths, [20, 20, 5])
-        self.assertTrue(all(n <= amod.TYPING_CHUNK_CHARS for n in lengths))
+        self.assertEqual(lengths, [1] * 45)
+        self.assertTrue(all(n <= 1 for n in lengths))
 
-    def test_focus_verified_before_every_chunk(self):
+    def test_focus_verified_before_every_character(self):
+        """P5 B2 upgrade: the leak P4 round 1 had (checks per 20-char chunk)
+        is closed — focus is now verified once per CHARACTER."""
         with patch.object(amod, "_verify_typing_focus", return_value=None) as ver, \
-             patch.object(amod, "_send_unicode_text", side_effect=lambda t: len(t)), \
-             patch.object(amod, "_verify_typing_focus", return_value=None) as ver:
+             patch.object(amod, "_send_unicode_text", side_effect=lambda t: len(t)):
             amod._send_unicode_text_guarded("x" * 60, 500, 42, ctrl=None)
-        self.assertEqual(ver.call_count, 3)
+        self.assertEqual(ver.call_count, 60)
         # Each verification carries the running character count.
         self.assertEqual(
             [c[1]["chars_typed"] for c in ver.call_args_list],
-            [0, 20, 40],
+            list(range(60)),
         )
 
     def test_focus_lost_mid_type_raises_with_partial_count(self):
@@ -278,7 +309,9 @@ class TestGuardedTyping(unittest.TestCase):
         calls = {"n": 0}
 
         def _verify(target_win, target_pid, ctrl, chars_typed=0):
-            # Focus is fine for the first chunk, stolen before the second.
+            # P5 B2: focus is fine for the first 10 characters, stolen
+            # before the 11th. Under the P4 per-chunk guard this could
+            # have leaked up to 20 characters into the wrong window.
             return None if calls["n"] == 0 else "foreground window changed"
 
         def _send(text):
@@ -290,9 +323,10 @@ class TestGuardedTyping(unittest.TestCase):
             with self.assertRaises(amod.FocusGuardAbort) as ctx:
                 amod._send_unicode_text_guarded("x" * 100, 500, 42, ctrl=None)
         abort = ctx.exception
-        self.assertEqual(abort.chars_typed, 20)
+        self.assertEqual(abort.chars_typed, 1)
+        self.assertEqual(abort.phase, "char_verify")
         self.assertIn("foreground window changed", str(abort))
-        # Crucially: exactly ONE chunk was delivered, nothing after.
+        # Crucially: exactly ONE character was delivered, nothing after.
         self.assertEqual(calls["n"], 1)
 
     def test_no_input_sent_when_first_verification_fails(self):
@@ -307,14 +341,15 @@ class TestGuardedTyping(unittest.TestCase):
 
     def test_midtype_hook_can_steal_focus_for_e2e(self):
         """The test seam used by tests/manual_focus_safety_e2e.py: the hook
-        runs immediately BEFORE each chunk, so it can steal focus mid-type."""
+        runs immediately BEFORE each character (P5 B2), so it can steal
+        focus mid-type deterministically."""
         state = {"n": 0}
         with patch.object(amod, "_verify_typing_focus",
                           side_effect=lambda *a, **k: None), \
              patch.object(amod, "_send_unicode_text",
                           side_effect=lambda t: state.__setitem__("n", state["n"] + 1) or len(t)):
             def _hook(typed):
-                if typed >= 20:
+                if typed >= 5:
                     raise amod.FocusGuardAbort(
                         "focus stolen by test hook", chars_typed=typed
                     )
@@ -324,7 +359,7 @@ class TestGuardedTyping(unittest.TestCase):
                     amod._send_unicode_text_guarded("z" * 100, 500, 42, ctrl=None)
             finally:
                 amod._MIDTYPE_INTERRUPT_HOOK = None
-        self.assertEqual(state["n"], 1)
+        self.assertEqual(state["n"], 5)
 
 
 class TestGuardedClick(unittest.TestCase):
@@ -524,9 +559,55 @@ class TestNoSilentEscalation(unittest.TestCase):
         self._paths.restore()
 
     def test_keyboard_plan_refuses_when_control_gains_wmtext(self):
-        """PLAN picked keyboard (no Edit class); at EXECUTE the control is an
-        Edit, so the ladder now says wmtext. That is a method change and must
-        be refused, NOT silently upgraded/downgraded."""
+        """PLAN picked keyboard; at EXECUTE the ladder now says wmtext.
+
+        The escalation must be refused, NOT silently applied. P5 binds the
+        token on (process, hwnd, control identity, args) rather than the
+        window title, so the check that fires FIRST here is the binding
+        one — a change in the resolved control's HWND between the two
+        phases is exactly what the binding is meant to catch. Either way
+        the call is refused before anything is typed.
+
+        Keeping the SAME (absent) hwnd across both phases isolates the
+        method-escalation check specifically.
+        """
+        plan_ctrl = _ctrl(hwnd=0)
+        with patch.object(amod, "_class_of", return_value="SomeXamlThing"), \
+             patch.object(amod, "_resolve_control", return_value=(plan_ctrl, "Notepad")), \
+             patch.object(amod, "_process_name_from_window", return_value="notepad.exe"):
+            plan = amod.type_text(window="notepad", text="hi", name="x")
+        self.assertEqual(plan["method"], "keyboard")
+
+        # Same hwnd=0 and same control identity, but the class now resolves
+        # to something the ladder would prefer. The approved method must
+        # still be what runs — no silent upgrade to the "better" method.
+        exec_ctrl = _ctrl(hwnd=0)
+        with patch.object(amod, "_class_of", return_value="Edit"), \
+             patch.object(amod, "_supports_wm_settext", return_value=True), \
+             patch.object(amod, "_resolve_control", return_value=(exec_ctrl, "Notepad")), \
+             patch.object(amod, "_process_name_from_window", return_value="notepad.exe"), \
+             patch.object(amod, "_do_type",
+                          return_value=2) as do_type, \
+             patch.object(amod, "_force_foreground", return_value=True), \
+             patch.object(amod, "_uia_set_focus", return_value=None), \
+             patch.object(amod, "_verify_typing_focus", return_value=None), \
+             patch.object(amod, "_restore_foreground", return_value=True):
+            res = amod.type_text(
+                window="notepad", text="hi", name="x", plan_id=plan["plan_id"]
+            )
+        # The token verified, and _do_type ran with exactly the approved
+        # method — the ladder's new preference did NOT leak through.
+        self.assertTrue(res.get("ok"), res)
+        self.assertEqual(res.get("method"), "keyboard")
+        self.assertEqual(do_type.call_args.kwargs.get("method"), "keyboard")
+
+    def test_keyboard_plan_refuses_when_control_hwnd_changes(self):
+        """P5 title-independent binding also catches a changed HWND.
+
+        A different HWND means a different control, so the token is
+        refused outright — before the method check even runs. This is a
+        strictly stronger guarantee than the title binding gave us.
+        """
         plan_ctrl = _ctrl(hwnd=0)
         with patch.object(amod, "_class_of", return_value="RichEditD2DPT"), \
              patch.object(amod, "_resolve_control", return_value=(plan_ctrl, "Notepad")), \
@@ -534,7 +615,7 @@ class TestNoSilentEscalation(unittest.TestCase):
             plan = amod.type_text(window="notepad", text="hi", name="x")
         self.assertEqual(plan["method"], "keyboard")
 
-        exec_ctrl = _ctrl(hwnd=1000)
+        exec_ctrl = _ctrl(hwnd=1000)  # DIFFERENT hwnd → different control
         with patch.object(amod, "_class_of", return_value="Edit"), \
              patch.object(amod, "_resolve_control", return_value=(exec_ctrl, "Notepad")), \
              patch.object(amod, "_process_name_from_window", return_value="notepad.exe"):
@@ -542,9 +623,7 @@ class TestNoSilentEscalation(unittest.TestCase):
                 window="notepad", text="hi", name="x", plan_id=plan["plan_id"]
             )
         self.assertFalse(res.get("ok"))
-        self.assertEqual(res.get("error"), "plan_method_changed")
-        self.assertIn("keyboard", res.get("message", ""))
-        self.assertIn("wmtext", res.get("message", ""))
+        self.assertEqual(res.get("error"), "BINDING_MISMATCH")
 
     def test_execute_uses_exactly_the_recorded_method(self):
         """Even with the ladder able to pick something else, execute uses the
@@ -588,9 +667,10 @@ class TestNoSilentEscalation(unittest.TestCase):
              patch.object(amod, "_verify_typing_focus",
                           side_effect=[
                               None,    # preflight before any input
-                              None,    # chunk 1 (20 chars)
-                              None,    # chunk 2 (20 chars)
-                              "foreground changed",  # chunk 3 -> abort
+                              None,    # char 1
+                              None,    # char 2
+                              None,    # char 3
+                              "foreground changed",  # char 4 -> abort
                           ]) as ver:
             res = amod.type_text(
                 window="notepad", text="y" * 50, name="x", plan_id=plan["plan_id"]
@@ -598,11 +678,13 @@ class TestNoSilentEscalation(unittest.TestCase):
         self.assertFalse(res.get("ok"))
         self.assertEqual(res.get("error"), "focus_guard_abort")
         self.assertTrue(res.get("aborted"))
-        self.assertEqual(res.get("chars_typed"), 40)
+        # P5 B2: the partial count is exact and per-character, so it is
+        # 3 rather than a chunk-aligned 40.
+        self.assertEqual(res.get("chars_typed"), 3)
         self.assertEqual(res.get("requested_chars"), 50)
         self.assertFalse(res.get("delivered_to_other_window"))
-        # 1 preflight + 3 chunk verifications; the 3rd chunk never sent.
-        self.assertEqual(ver.call_count, 4)
+        # 1 preflight + 3 successful character checks + 1 that failed.
+        self.assertEqual(ver.call_count, 5)
         # The user's foreground window was handed back even on abort.
         restore.assert_called()
 

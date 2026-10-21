@@ -355,15 +355,52 @@ def _build_binding(tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
 
     ``args`` is the dict we resolved at EXECUTE time. Only the
     action-specific subset is hashed for args_hash: text for type_text,
-    empty dict for click_control (no args to bind).
+    the whole-sequence digest for run_sequence, empty dict for
+    click_control / focus_window (no args to bind).
+
+    P5 NOTE — TITLE-INDEPENDENT IDENTITY:
+
+    Earlier rounds bound on the *resolved window title*. That was good
+    enough until a user typed into Notepad and the title changed
+    (Notepad's `*` dirty marker) between plan and execute, producing a
+    spurious BINDING_MISMATCH. The new key fields are identity-bearing
+    but title-independent:
+
+      * ``process``         — the executable name; stable across the
+                                 lifetime of the app.
+      * ``hwnd``            — the native HWND; stable for the lifetime
+                                 of the window, recreated only if the
+                                 app is relaunched (in which case a
+                                 relaunch should re-plan anyway).
+      * ``control_name``    — the UIA-stable name attribute.
+      * ``automation_id``   — the UIA-stable automation id (often empty
+                                 for XAML apps, that's fine).
+      * ``args_hash``       — SHA-256 over the action's bound arguments
+                                 (the typed text for type_text, the
+                                 sequence digest for run_sequence).
+
+    This binding is robust to window-title changes (Notepad's `*` dirty
+    marker, the user's tab rename, an Office 'Document1' vs 'Document1
+    [Read-Only]' etc.) because the title is no longer on the binding
+    path. It is NOT robust to the target app being closed and reopened
+    with the same title — that's a different plan.
     """
     if tool == "type_text":
         args_hash = _hash_args({"text": args.get("text")})
+    elif tool == "run_sequence":
+        # P5: one token covers the whole sequence. The digest covers the
+        # canonical step list AND each step's resolved target + method, so
+        # reordering, editing text, or a changed resolution invalidates it.
+        args_hash = _hash_args({"steps_hash": args.get("steps_hash") or ""})
     else:
         args_hash = _hash_args({})
     return {
         "tool": tool,
-        "window": args.get("window") or "",
+        "process": args.get("process") or "",
+        # `hwnd` is normally a single integer. For run_sequence it is a
+        # "|"-joined string of one hwnd per step, so it is kept as an
+        # opaque comparable value and only normalized to "" when absent.
+        "hwnd": args.get("hwnd") if args.get("hwnd") not in (None, "") else 0,
         "control_name": args.get("name") or "",
         "automation_id": args.get("automation_id") or "",
         "args_hash": args_hash,
@@ -371,10 +408,13 @@ def _build_binding(tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # Fields that MUST match between PLAN and EXECUTE for security.
-# hwnd, process, control_type are informational only (stable across
-# the same control but may vary if the OS recreates the HWND).
+# These are the same fields emitted by _build_binding on the PLAN side
+# and re-computed by the verifier on the EXECUTE side. `process` (an exe
+# name) and `hwnd` (a window handle) together identify the target window
+# even when the title changes; the two control identity attributes
+# ensure the right UIA node is being touched.
 _BINDING_KEY_FIELDS = frozenset({
-    "tool", "window", "control_name", "automation_id", "args_hash",
+    "tool", "process", "hwnd", "control_name", "automation_id", "args_hash",
 })
 
 
@@ -386,15 +426,39 @@ def _binding_matches(token_b: Dict[str, Any], exec_b: Dict[str, Any]) -> bool:
 
 
 def check_method_mismatch(token_method: str, ctrl_method: str) -> bool:
-    """True when the resolved control now uses a different method.
+    """True when the resolved control now uses a fundamentally different method.
 
-    The token must re-verify every field at EXECUTE. If the resolved
-    control's method changed between PLAN and EXECUTE (e.g. a control
-    gained a writable ValuePattern in the meantime), the token's
-    method no longer applies and we refuse. Pure rename-tolerant
-    (cosmetically equivalent methods still compare equal).
+    Methods that are equivalent (both go through the same underlying input
+    tier) are not considered mismatches — a user who approved a
+    method-binding plan should not be forced to re-plan just because the
+    exact method label shifted between PLAN and EXECUTE.
+
+    Equivalence classes
+    -------------------
+    All synthetic-input methods (keyboard, coordinate) are equivalent from
+    a safety / approval standpoint — they both inject physical keystrokes
+    into the foreground window and require the same focus guard.
+
+    All message-based methods (wmtext, wmchar, emreplace, wmpaste) are
+    equivalent — they all send window messages to the target control
+    without touching the keyboard or the foreground.
+
+    The only genuine escalation is: message tier -> synthetic-input tier.
     """
-    return token_method != ctrl_method
+    # Fast path: truly identical labels are never mismatches.
+    if token_method == ctrl_method:
+        return False
+    # Both in the message tier → not a mismatch (equivalent delivery path).
+    MESSAGE_METHODS = frozenset({"wmtext", "wmchar", "emreplace", "wmpaste"})
+    if token_method in MESSAGE_METHODS and ctrl_method in MESSAGE_METHODS:
+        return False
+    # Both in the synthetic-input tier → not a mismatch (equivalent path).
+    SYNTHETIC_INPUT_METHODS = frozenset({"keyboard", "coordinate"})
+    if (token_method in SYNTHETIC_INPUT_METHODS
+            and ctrl_method in SYNTHETIC_INPUT_METHODS):
+        return False
+    # Different tiers → genuine escalation → mismatch.
+    return True
 
 
 # --------------------- consumed-id set -------------------------------------

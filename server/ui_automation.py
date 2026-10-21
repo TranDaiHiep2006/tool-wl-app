@@ -12,6 +12,8 @@ from typing import Iterator, List, Optional, Tuple
 
 import uiautomation as uia
 
+from server.textnorm import contains_text, nfc, nfc_fold
+
 
 def init() -> None:
     """Initialize UIA in the current thread (idempotent)."""
@@ -257,7 +259,7 @@ def list_windows() -> List[dict]:
                 "is_foreground": _is_foreground(int(ctrl.NativeWindowHandle) or hwnd),
             }
         )
-    out.sort(key=lambda w: (not w["is_foreground"], w["title"].lower()))
+    out.sort(key=lambda w: (not w["is_foreground"], nfc_fold(w["title"])))
     return out
 
 
@@ -288,7 +290,14 @@ def get_foreground_window() -> dict:
 
 
 def find_window(window: str) -> Optional[uia.WindowControl]:
-    """Find a top-level window by hwnd (int) or fuzzy title match."""
+    """Find a top-level window by hwnd (int) or fuzzy title match.
+
+    Title matching is Vietnamese-safe: both the needle and every candidate
+    title are normalized to Unicode NFC and case-folded, so a decomposed
+    title ("lịch thi.xlsx - Excel" with combining diacritics, which is
+    what several Windows APIs return) still matches the same word typed
+    in precomposed NFC form. See server/textnorm.py.
+    """
     # hwnd?
     try:
         hwnd = int(window)
@@ -298,7 +307,7 @@ def find_window(window: str) -> Optional[uia.WindowControl]:
     except (TypeError, ValueError):
         pass
 
-    needle = (window or "").strip().lower()
+    needle = nfc_fold((window or "").strip())
     if not needle:
         return None
 
@@ -326,7 +335,7 @@ def find_window(window: str) -> Optional[uia.WindowControl]:
 
     for w in candidates:
         try:
-            title = (w.Name or "").lower()
+            title = nfc_fold(w.Name or "")
             wh = int(w.NativeWindowHandle)
         except Exception:
             continue
@@ -488,6 +497,9 @@ def get_control_text(window: str, automation_id_or_name: str) -> dict:
     target = (automation_id_or_name or "").strip()
     if not target:
         raise ValueError("automation_id_or_name is required")
+    # Vietnamese-safe: compare in canonical, case-folded form so a
+    # decomposed control name still matches its precomposed spelling.
+    target_key = nfc_fold(target)
 
     # Search breadth-first up to a small budget
     queue: List[Tuple[uia.Control, int]] = [(win, 0)]
@@ -503,7 +515,7 @@ def get_control_text(window: str, automation_id_or_name: str) -> dict:
             continue
         aid = (ctrl.AutomationId or "").strip()
         name = (ctrl.Name or "").strip()
-        if aid == target or name == target:
+        if nfc_fold(aid) == target_key or nfc_fold(name) == target_key:
             text = _extract_text(ctrl) or (ctrl.Name or "") or ""
             return {
                 "found": True,

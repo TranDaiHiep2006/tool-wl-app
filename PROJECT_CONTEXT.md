@@ -1,6 +1,6 @@
 # PROJECT_CONTEXT
 
-Architecture and conventions for `tool-wl-app` (P1 + P2 + P3 + P4).
+Architecture and conventions for `tool-wl-app` (P1 + P2 + P3 + P4 + P5).
 
 ## 1. Goals (long-term)
 
@@ -11,7 +11,10 @@ on the desktop** (click, type, focus windows) within a strict safety gate,
 guiding a human user step by step through operations they perform manually.
 
 P1-P3 are strictly read-only. P4 adds three action tools behind a
-two-phase plan/execute safety gate.
+two-phase plan/execute safety gate. P5 makes the whole stack
+**Vietnamese-safe end to end**, hardens focus safety with verified
+focus-free window-message tiers, and cuts approval spam with standing
+consent plus a batched `run_sequence`.
 
 ## 2. Tech stack
 
@@ -33,16 +36,19 @@ mouse, type, or click.
 ```
 server/
 ├── __init__.py
-├── mcp_server.py     # FastMCP registration of 18 tools (9 P1 + 2 P2 + 3 P3 + 3 P4)
-├── ui_automation.py  # window list, foreground, UIA tree, control text
+├── mcp_server.py     # FastMCP registration of 19 tools (9 P1 + 2 P2 + 3 P3 + 4 P4 + 1 P5)
+├── ui_automation.py  # window list, foreground, UIA tree, control text (NFC-safe matching)
 ├── screenshots.py    # mss + JPEG resize helpers
-├── ocr.py            # Windows.Media.Ocr (runs on a dedicated MTA thread)
+├── ocr.py            # Windows.Media.Ocr (runs on a dedicated MTA thread; vi-VN preferred)
 ├── browser.py        # read active tab info from chrome/edge/firefox (address bar)
 ├── browser_dom.py    # P2: get_page_text / get_page_structure via WS bridge
 ├── clipboard.py      # read clipboard text or detect non-text formats
 ├── bridge_auth.py    # P3: per-install token for browser bridge
 ├── office_com.py     # P3: Office COM read-only tools
-└── actions.py        # P4: click_control, type_text, focus_window + safety gate
+├── textnorm.py       # P5: NFC / case-folded Vietnamese-safe text comparison helpers
+├── action_token.py   # P4/P5: HMAC-signed plan tokens (title-independent binding)
+└── actions.py        # P4/P5: click_control, type_text, focus_window,
+                      #        run_sequence + safety gate + focus-free message tiers
 
 native_host/
 ├── __init__.py
@@ -51,7 +57,12 @@ native_host/
 scripts/
 ├── register_mcp.py            # P1: merge tool-wl-app into ~/.cursor/mcp.json
 ├── register_native_host.py    # P2: write HKCU registry keys + manifest JSON
-└── unregister_native_host.py  # P2: reverse of register_native_host.py
+├── unregister_native_host.py  # P2: reverse of register_native_host.py
+├── rotate_bridge_token.py     # P3: rotate the per-install browser bridge secret
+├── console.py                 # P5: persistent Tkinter MCP console (launcher)
+├── console.bat                # P5: one-click launcher for the console
+├── console_core.py            # P5: transport + framing + tool-call plumbing
+└── console_selftest.py        # P5: in-process FastMCP self-test (`--selftest`)
 
 extension/
 ├── manifest.json    # MV3: content scripts + background service worker
@@ -66,15 +77,22 @@ tests/
 ├── edge_e2e_structure.py       # P2: same for get_page_structure
 ├── test_no_action_api.py        # static scan: zero action APIs except in actions.py
 ├── test_actions_gate.py         # P4: 20 gate unit tests (hermetic mocks)
+├── test_action_focus_safety.py  # P4/P5: method ladder, message tiers, focus guards
+├── test_action_token.py         # P4/P5: signed-token issue/verify + refusal taxonomy
+├── test_actions_sequence.py     # P5: run_sequence binding + atomic abort semantics
+├── test_textnorm.py             # P5: NFC / case-folded matching helpers
 ├── test_ui_automation.py        # list_windows / foreground / ui_tree / control_text + hermetic mock variants
 ├── test_screenshots.py          # screenshot size and shape constraints
-├── test_ocr.py                # synthetic image OCR + truncation
+├── test_ocr.py                # synthetic image OCR + truncation + vi-VN language reporting
 ├── test_clipboard_browser.py    # clipboard + get_browser_tab_info
-├── test_mcp_registration.py     # all 18 tools are registered
+├── test_mcp_registration.py     # all 20 tools are registered
 ├── test_browser_dom.py          # P2: caps, framing, WS round-trip, timeout envelope
 ├── test_office_com.py           # P3: Office COM mock coverage + no-mutating-API checks
 ├── test_quota.py               # per-tool envelope size budgets
-└── manual_actions_e2e.py      # P4: Notepad E2E (NOT in pytest; run manually)
+├── probe_msg_input_candidates.py   # P5: live probe of WM_CHAR / EM_REPLACESEL / WM_PASTE
+├── manual_actions_e2e.py      # P4: Notepad E2E (NOT in pytest; run manually)
+├── manual_focus_safety_e2e.py # P4/P5: focus-flip / ladder / BM_CLICK E2E
+└── manual_vietnamese_e2e.py   # P5: Vietnamese round-trip E2E on real Notepad
 ```
 
 ## 4. Conventions
@@ -195,9 +213,14 @@ applies.
 {
   "enabled": true,
   "allowed_processes": ["notepad.exe"],
-  "deny_labels": ["delete", "format", "uninstall", "shut down", "pay now", "remove account"]
+  "deny_labels": ["delete", "format", "uninstall", "shut down", "pay now", "remove account"],
+  "auto_execute_processes": []
 }
 ```
+
+`auto_execute_processes` is the P5 standing-consent list (§8.3 C1). It is
+empty by default; entries bypass the plan phase entirely and return
+`auto_executed: true`. Deny labels still apply to them.
 
 ### 7.2 Three action tools — `server/actions.py`
 
@@ -267,7 +290,12 @@ Focus-free methods are preferred; `SendInput` is a guarded last resort.
 | ---- | ----------- | --------------- | ------------------- |
 | 1 | UIA `ValuePattern.SetValue` | UIA `Invoke` / `Toggle` / `SelectionItem` / `ExpandCollapse` | No |
 | 2 | `WM_SETTEXT` on `NativeWindowHandle`, verified by read-back | `BM_CLICK` + `WM_COMMAND/BN_CLICKED` for Button-class controls | No |
-| 3 | `SendInput` keyboard, ≤20-char chunks | `SendInput` coordinate click | Yes — guarded |
+| 3 | `WM_CHAR` / `EM_REPLACESEL` / `WM_PASTE` (P5 §8.2) | — | No |
+| 4 | `SendInput` keyboard, ≤20-char chunks | `SendInput` coordinate click | Yes — guarded |
+
+Tiers 1-3 are **window messages**, which are addressed to a specific
+`HWND` and never consult or change the foreground window. Tier 3 is what
+makes background typing possible at all — see §8.2.
 
 **Key code (`server/actions.py`):**
 
@@ -342,7 +370,198 @@ Edit `config/actions.json` directly:
 To block all actions immediately, create an empty file named
 `config/STOP_ACTIONS` (no content needed). Remove it to restore access.
 
-## 8. Proposed P5 content
+## 8. P5 — DELIVERED
+
+P5 has four sections. All four are implemented, unit-tested, and
+live-E2E-verified.
+
+### 8.1 Section A — Vietnamese end-to-end
+
+**The problem.** Vietnamese has several Unicode representations of the
+same visible string. Windows APIs, the clipboard, and some app
+frameworks return **NFD (decomposed)** text — `"o"` + combining horn +
+combining tilde — while a user typing Telex/Unikey or an agent sending
+JSON produces **NFC (precomposed)** text. Comparing raw code points
+silently fails: a window titled `"lịch thi.xlsx - Excel"` does not match
+the NFC spelling of the same title.
+
+**The fix.** New dependency-free module `server/textnorm.py`:
+
+| Function | Purpose |
+| -------- | ------- |
+| `nfc(text)` | Canonical composition; ASCII fast-path. |
+| `nfc_fold(text)` | NFC **then** `casefold()` — the canonical, case-insensitive key. |
+| `same_text(a, b)` | Equality ignoring case and composition. |
+| `contains_text(hay, needle)` | Substring test ignoring case and composition. |
+
+NFC is applied *before* casefolding on purpose — `casefold` can change
+string length (ß → ss), and the reverse order can leave one side
+decomposed and the other composed.
+
+Every user-visible string that participates in matching now goes through
+`nfc_fold` on **both** sides:
+
+- `ui_automation.find_window` — window title matching (fuzzy substring)
+  and the `list_windows` sort key.
+- `ui_automation.get_control_text` — `automation_id` / `Name` lookup.
+- `actions._resolve_control` — control name and `automation_id` matching
+  on the action path.
+
+**Vietnamese title resolution.** With NFC folding, `"Lịch thi.xlsx - Excel"`
+now resolves whether the app reports it decomposed or composed, and the
+`get_ui_tree` / `click_control` / `type_text` paths all agree on which
+control is meant.
+
+**`KEYEVENTF_UNICODE` typing.** The synthetic-input path already
+delivered text as UTF-16 code units via `KEYEVENTF_UNICODE`, so
+Vietnamese characters are never routed through a keyboard layout. This
+was verified rather than assumed — see §8.2, where the message tiers make
+this the *last* resort anyway.
+
+**OCR `vi-VN` preference.** `server/ocr.py` now prefers the `vi-VN`
+recognizer language and falls back through the installed packs. Every OCR
+response carries a `"language"` field naming the language pack actually
+used, so the agent knows whether diacritics were recognised with a
+Vietnamese model or guessed by the English one.
+
+**Unit tests** (`tests/test_textnorm.py`, extended `tests/test_ocr.py`)
+and a **live E2E** (`tests/manual_vietnamese_e2e.py`): types
+`"Hà Nội những ngày đầu đông, sương mù giăng kín lối cũ."` into real
+Notepad via `type_text`, reads it back through `get_control_text`, and
+asserts **exact NFC equality** between what was sent and what came back.
+
+### 8.2 Section B — focus safety, round 2 (focus-free message tiers)
+
+Round 1 proved typing in the background is impossible with synthetic
+input, and made the keyboard fallback abort rather than leak keystrokes
+into the wrong window. Round 2 attacks the remaining weakness: **the
+keyboard fallback still requires stealing foreground focus at all.**
+
+The fix is to send text as **window messages** instead. A window message
+is addressed to a specific `HWND`; it does not consult, change, or
+depend on the foreground window. Windows 11 Notepad's editor
+(`RichEditD2DPT`) was probed live and accepts all of them.
+
+The ladder, focus-free first:
+
+| Tier | `type_text` method | Mechanism | Focus |
+| ---- | ------------------ | --------- | ----- |
+| 1 | `value` | UIA `ValuePattern.SetValue` | untouched |
+| 2 | `wmtext` | `WM_SETTEXT` on `NativeWindowHandle`, verified by read-back | untouched |
+| 3 | `wmchar` | `WM_CHAR` per character | untouched |
+| 3 | `emreplace` | `EM_REPLACESEL` (RichEdit family) | untouched |
+| 3 | `wmpaste` | `WM_PASTE` with clipboard save + restore | untouched |
+| 4 | `keyboard` | `SendInput` Unicode, per-character guarded | borrowed, restored |
+
+`WM_CHAR` is the important one for Vietnamese: it delivers raw character
+codes directly to the control, so it is **exact for diacritics** and
+involves no IME and no keyboard-layout mapping.
+
+**Clipboard save/restore.** `WM_PASTE` needs the clipboard to hold the
+text, so the previous clipboard contents are saved first and restored
+afterwards, in a `finally`. Both directions use
+`_open_clipboard_with_retry` — a bounded retry loop that sleeps briefly
+and retries, because RichEdit can hold the clipboard open transiently
+and the first attempt reliably fails.
+
+**Per-character focus guard (round-2 tightening).** The chunked
+"re-verify every 20 characters" check is not good enough for tier 4:
+focus could move *and* keystrokes could land between two checks. The
+guard now re-verifies **before every single character**. Additionally,
+`SendInput` typing is aborted immediately if the target is not the
+foreground window **at the start of execute**, rather than discovering
+it after stealing focus.
+
+**Method equivalence classes.** The signed token binds the resolved
+method, but `check_method_mismatch` treats these as internally
+compatible, so a re-plan that lands on a sibling focus-free message is
+not reported as tampering:
+
+- message tier — `wmtext`, `wmchar`, `emreplace`, `wmpaste`
+- synthetic-input tier — `keyboard`, `coordinate`
+
+Anything outside those classes is still a hard `plan_method_changed`
+refusal. This is a *documented* equivalence, not a loosening: the
+classes still bind exactly.
+
+**Probe and verification.** `tests/probe_msg_input_candidates.py` sends
+each candidate message to real Notepad with Vietnamese text and checks
+the read-back **and** that the clipboard survives intact.
+
+**Unit tests** (`tests/test_action_focus_safety.py`) cover the full
+ladder order, clipboard preservation, the per-character guard, the
+abort-on-not-foreground-at-start path, and the equivalence classes.
+**Live E2E** (`tests/manual_focus_safety_e2e.py`) proves zero focus
+theft, the `BM_CLICK` class gate, and ladder order on real windows.
+
+### 8.3 Section C — approval spam mitigation
+
+The user was drowning in confirmations — ten or more "shall I proceed?"
+questions for a routine "open Notepad, open a tab, type a line" task.
+
+**C1 — standing consent.** `config/actions.json` gains:
+
+```jsonc
+{
+  "enabled": true,
+  "allowed_processes": ["notepad.exe"],
+  "deny_labels": ["delete", "format", "uninstall", "shut down", "pay now", "remove account"],
+  "auto_execute_processes": []
+}
+```
+
+Any process listed in `auto_execute_processes` runs its action in a
+**single call**, returning `"auto_executed": true` instead of a plan.
+It is deliberately empty by default: adding a process is an explicit,
+per-app grant, and the user must opt in. Deny labels are unaffected —
+a `delete` button in an auto-execute app still refuses.
+
+**C2 — `run_sequence`.** New MCP tool (tool #20) that runs up to **10**
+ordered steps — `focus_window`, `click_control`, `type_text` — under
+**one** plan and therefore one approval.
+
+- The plan's token binds a canonical digest of the whole step list
+  (`steps_hash`) **plus** each step's resolved target and method, so
+  reordering a step, editing any text, or changing any target
+  invalidates the token.
+- Steps run in order; the **first failure aborts the rest**, and the
+  result reports per-step status (`done` / `failed` / `skipped`).
+- The safety gate is re-checked for **every** step at execute time, not
+  just once for the batch.
+- If every step targets an `auto_execute_processes` app, it runs
+  directly with `auto_executed: true` and no plan at all.
+
+**C3 — tool descriptions rewritten.** A shared `_APPROVAL_RULES` block is
+now prepended to the action tool descriptions, stating the rule
+plainly: **the plan is the approval** — present it once as one short
+block and proceed; do not add a second question per step. The one
+carve-out is explicit: anything matching a `deny_label` always needs its
+own confirmation, every time.
+
+**Tests:** `tests/test_actions_sequence.py` covers token binding
+(digest stability, reorder detection, text-change detection) and atomic
+abort semantics (abort on first failure, correct per-step statuses,
+gate re-checked per step).
+
+### 8.4 Section D — persistent console
+
+Repeated one-shot MCP clients are slow and awkward for interactive
+debugging, so P5 ships a small persistent console.
+
+| File | Purpose |
+| ---- | ------- |
+| `scripts/console.py` | Tkinter UI entry point. |
+| `scripts/console_core.py` | Transport, JSON-RPC framing, tool-call plumbing. |
+| `scripts/console.bat` | One-click launcher. |
+| `scripts/console_selftest.py` | In-process FastMCP self-test (`--selftest`). |
+
+The UI uses a UTF-8-capable font (Segoe UI) so Vietnamese text renders
+correctly in the transcript pane.
+
+The self-test runs **in-process against `mcp`** rather than spawning a
+child over stdio. That matters: a stdio-based self-test deadlocks when
+run from a process that owns the same pipes, whereas the in-process
+path exercises the real tool objects directly.
 
 ## 7b. P3 — DELIVERED
 
@@ -405,7 +624,7 @@ Tests in `tests/test_browser_dom.py::TestBridgeAuth` cover:
 - Plus `TestBridgeAuthModule` covering token persistence, idempotency,
   rotation, and `hmac.compare_digest`.
 
-## 8. Quota-saving design notes
+## 9. Quota-saving design notes
 
 - `get_ui_tree` walks breadth-first with a hard node cap; when over the cap
   the response carries `"truncated": true`. Most calls return < 60 KB JSON.
@@ -417,7 +636,27 @@ Tests in `tests/test_browser_dom.py::TestBridgeAuth` cover:
 - `get_page_structure` truncates at 200 items; on real pages measured
   0.1–22.5 KB (worst case = GitHub repo home + Wikipedia long article).
 
-## 10. References
+## 10. Proposed P6 content
+
+1. **Per-app symbolic prompts.** When `auto_execute_processes` contains
+   a process, return the plan description anyway as a soft prompt —
+   the user can intercept any single step if they wish, and the tool’s
+   audit log already records the auto approval.
+2. **DPI-aware multi-monitor capture.** P1’s screenshot caps the long
+   edge at 1280 px. With mixed-DPI multi-monitor setups the scaled
+   image can lose readable detail. P6 could let the user pick the
+   source monitor and a target scale.
+3. **Selector-based frame-aware DOM extraction.** `all_frames: true`
+   in the manifest plus a selector argument to `get_page_text` /
+   `get_page_structure` for embedded iframes.
+4. **OCR per-word confidence.** Today the OCR tools return word
+   positions but not confidence. A per-word `confidence` field would
+   let the agent weigh its own recheck.
+5. **`run_sequence_with_rollback`.** Today the first failure aborts
+   the rest; adding a `rollback` key per step would let the user
+   define a compensating sequence.
+
+## 11. References
 
 - Prompt: `prompt.md` (P1 + P2 + P3 + P4 brief).
 - Repo: https://github.com/TranDaiHiep2006/tool-wl-app

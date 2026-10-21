@@ -81,8 +81,11 @@ class TestTokenRoundTrip(unittest.TestCase):
             "args_hash": t._hash_args({"text": "hello"}),
         }
         token = t.issue_token(tool="type_text", method="keyboard", binding=binding)
+        # P5: title-independent binding; verifier needs process+hwnd from
+        # the resolved window, not the (potentially fuzzy) title.
         args = {
-            "window": "Untitled - Notepad",
+            "process": "notepad.exe",
+            "hwnd": 123456,
             "automation_id": "",
             "name": "Text editor",
             "text": "hello",
@@ -176,7 +179,7 @@ class TestRefusalBuckets(unittest.TestCase):
     def test_expired(self):
         t = self._tok
         token = t.make_expired_token("type_text", "keyboard", self._binding(), t._SECRET)
-        vr = t.verify_token(token, {"window": "Untitled - Notepad", "automation_id": "", "name": "Text editor", "text": "hello"})
+        vr = t.verify_token(token, {"process": "notepad.exe", "hwnd": 123, "automation_id": "", "name": "Text editor", "text": "hello"})
         self.assertFalse(vr.ok)
         self.assertEqual(vr.reason, "EXPIRED")
         self.assertIsInstance(vr.plan_id, str)
@@ -189,7 +192,7 @@ class TestRefusalBuckets(unittest.TestCase):
         plan_id = t.decode_token(token)["plan_id"]
         # Simulate server A consumed it.
         t.mark_consumed(plan_id, t.CONSUMED_DIR)
-        vr = t.verify_token(token, {"window": "Untitled - Notepad", "automation_id": "", "name": "Text editor", "text": "hello"})
+        vr = t.verify_token(token, {"process": "notepad.exe", "hwnd": 123, "automation_id": "", "name": "Text editor", "text": "hello"})
         self.assertFalse(vr.ok)
         self.assertEqual(vr.reason, "CONSUME_RACE")
 
@@ -197,7 +200,9 @@ class TestRefusalBuckets(unittest.TestCase):
         t = self._tok
         binding = self._binding(tool="click_control")
         token = t.issue_token("click_control", "invoke", binding)
-        vr = t.verify_token(token, {"window": "Some Other Window", "automation_id": "", "name": "Edit"})  # wrong tool + window
+        # P5: title-independent; mismatch happens by changing the resolved
+        # identity (process + control name), not the title.
+        vr = t.verify_token(token, {"process": "other.exe", "hwnd": 123, "automation_id": "", "name": "Edit"})
         self.assertFalse(vr.ok)
         self.assertEqual(vr.reason, "BINDING_MISMATCH")
 
@@ -205,7 +210,7 @@ class TestRefusalBuckets(unittest.TestCase):
         t = self._tok
         binding = self._binding()
         token = t.issue_token("type_text", "keyboard", binding)
-        vr = t.verify_token(token, {"window": "Untitled - Notepad", "automation_id": "", "name": "Text editor", "text": "different text"})
+        vr = t.verify_token(token, {"process": "notepad.exe", "hwnd": 123, "automation_id": "", "name": "Text editor", "text": "different text"})
         self.assertFalse(vr.ok)
         self.assertEqual(vr.reason, "BINDING_MISMATCH")
 
@@ -215,6 +220,53 @@ class TestRefusalBuckets(unittest.TestCase):
         resolved_method = "keyboard"
         self.assertTrue(t.check_method_mismatch(token_method, resolved_method))
         self.assertFalse(t.check_method_mismatch("keyboard", "keyboard"))
+
+    def test_method_mismatch_identity(self):
+        """Identical labels are never a mismatch."""
+        t = self._tok
+        for m in ("value", "wmtext", "wmchar", "emreplace", "wmpaste",
+                  "keyboard", "coordinate", "invoke", "toggle", "bmclick"):
+            self.assertFalse(t.check_method_mismatch(m, m), m)
+
+    def test_method_equivalence_message_tier(self):
+        """P5: any two message methods are equivalent — same focus-free tier."""
+        t = self._tok
+        message = ("wmtext", "wmchar", "emreplace", "wmpaste")
+        for a in message:
+            for b in message:
+                self.assertFalse(
+                    t.check_method_mismatch(a, b),
+                    f"{a} vs {b} are both message-tier — must not mismatch",
+                )
+
+    def test_method_equivalence_synthetic_input_tier(self):
+        """P5: keyboard and coordinate are the same tier for approval."""
+        t = self._tok
+        self.assertFalse(t.check_method_mismatch("keyboard", "coordinate"))
+        self.assertFalse(t.check_method_mismatch("coordinate", "keyboard"))
+
+    def test_method_mismatch_cross_tier_refused(self):
+        """P5: message-tier -> synthetic-input-tier IS a real escalation."""
+        t = self._tok
+        for msg in ("wmtext", "wmchar", "emreplace", "wmpaste"):
+            for syn in ("keyboard", "coordinate"):
+                self.assertTrue(
+                    t.check_method_mismatch(msg, syn),
+                    f"{msg} -> {syn} is an escalation and must refuse",
+                )
+                self.assertTrue(
+                    t.check_method_mismatch(syn, msg),
+                    f"{syn} -> {msg} is a downgrade; still a tier change",
+                )
+
+    def test_method_mismatch_pattern_tier(self):
+        """P5: UIA-pattern methods escalate over message and input tiers."""
+        t = self._tok
+        for pattern in ("value", "invoke", "toggle", "bmclick"):
+            self.assertTrue(t.check_method_mismatch(pattern, "wmtext"), pattern)
+            self.assertTrue(t.check_method_mismatch(pattern, "keyboard"), pattern)
+            self.assertTrue(t.check_method_mismatch("wmtext", pattern), pattern)
+            self.assertTrue(t.check_method_mismatch("keyboard", pattern), pattern)
 
 
 class TestCrossProcessSimulation(unittest.TestCase):
@@ -250,7 +302,7 @@ class TestCrossProcessSimulation(unittest.TestCase):
         }
         token = t.issue_token("type_text", "keyboard", binding)
         # Server B verifies (same secret, same binding).
-        vr = t.verify_token(token, {"window": "Untitled - Notepad", "automation_id": "", "name": "Text editor", "text": "hello"})
+        vr = t.verify_token(token, {"process": "notepad.exe", "hwnd": 123, "automation_id": "", "name": "Text editor", "text": "hello"})
         self.assertTrue(vr.ok)
 
     def test_plan_consumed_by_a_refused_by_b(self):
@@ -267,7 +319,7 @@ class TestCrossProcessSimulation(unittest.TestCase):
         # Server A marks consumed.
         t.mark_consumed(plan_id, t.CONSUMED_DIR)
         # Server B tries — consumed flag survives the "process boundary".
-        vr = t.verify_token(token, {"window": "Untitled - Notepad", "automation_id": "", "name": "Text editor", "text": "hello"})
+        vr = t.verify_token(token, {"process": "notepad.exe", "hwnd": 123, "automation_id": "", "name": "Text editor", "text": "hello"})
         self.assertFalse(vr.ok)
         self.assertEqual(vr.reason, "CONSUME_RACE")
 
@@ -282,7 +334,7 @@ class TestCrossProcessSimulation(unittest.TestCase):
         }
         token = t.issue_token("type_text", "keyboard", binding)
         tampered = t.make_tampered_token(token, t._SECRET)
-        vr = t.verify_token(tampered, {"window": "Untitled - Notepad", "automation_id": "", "name": "Text editor", "text": "hello"})
+        vr = t.verify_token(tampered, {"process": "notepad.exe", "hwnd": 123, "automation_id": "", "name": "Text editor", "text": "hello"})
         self.assertFalse(vr.ok)
         self.assertEqual(vr.reason, "SIGNATURE")
 

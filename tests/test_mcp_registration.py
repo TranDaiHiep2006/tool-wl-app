@@ -35,6 +35,8 @@ EXPECTED_TOOLS = {
     "click_control",
     "type_text",
     "focus_window",
+    # P5: batched actions under a single approval
+    "run_sequence",
 }
 
 
@@ -55,7 +57,7 @@ class TestMCPRegistration(unittest.TestCase):
 
         names = asyncio.run(_go())
         # FastMCP may add internal tools (e.g., debug); we only assert the spec tools are present.
-        # P1 had 9 + 2 (P2) + 3 (P3) + 3 (P4) = 18 total.
+        # 9 (P1) + 2 (P2) + 3 (P3) + 3 (P4) + 1 (P5) = 20 total.
         self.assertEqual(len(names & EXPECTED_TOOLS), len(EXPECTED_TOOLS))
 
 

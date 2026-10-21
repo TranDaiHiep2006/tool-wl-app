@@ -168,6 +168,9 @@ def screenshot(
     name="ocr_region",
     description=(
         "Run offline OCR on a screen region. Returns [{text, x, y, w, h, confidence proxy}].\n"
+        "Every response carries a 'language' field naming the OCR recognizer that ran. "
+        "Vietnamese text is only read correctly when it reports 'vi-VN'; with a non-Vietnamese "
+        "recognizer the diacritics are dropped (e.g. 'suong mu'), so treat such text as unverified.\n"
         "When to use: when a UI tree is unavailable (canvas, image-only, remote desktop) and "
         "you need to read text.\n"
         "When NOT to use: for normal UIA apps — get_ui_tree is cheaper."
@@ -187,7 +190,7 @@ def ocr_region(
     name="ocr_image",
     description=(
         "Run offline OCR on an image file on disk. "
-        "Returns [{text, x, y, w, h}] per word.\n"
+        "Returns [{text, x, y, w, h}] per word, plus 'language' naming the recognizer used.\n"
         "When to use: read text out of a saved screenshot or photo.\n"
         "When NOT to use: for live screen regions — use ocr_region."
     ),
@@ -202,7 +205,10 @@ def ocr_image(file_path: str, max_lines: int = 200) -> dict:
     name="find_text_on_screen",
     description=(
         "OCR the full screen and search for a substring. "
-        "Returns [{text, x, y, w, h}] for matches (case-insensitive by default).\n"
+        "Returns [{text, x, y, w, h}] for matches (case-insensitive by default, "
+        "Vietnamese-safe: matching ignores Unicode composition).\n"
+        "The response carries 'language' naming the recognizer used — Vietnamese is only "
+        "read reliably when it reports 'vi-VN'.\n"
         "Returns coordinates ONLY (P1 is read-only — no clicking).\n"
         "When to use: locate a label/button by visible text when its automation_id is unknown.\n"
         "When NOT to use: for whole-document extraction — use ocr_region on a small area."
@@ -351,25 +357,43 @@ def read_powerpoint_text(max_slides: int = 100) -> dict:
 
 # ---------------------- P4 tools 16/17/18: Action tools (with safety gate) -
 
+# ------------------ P4/P5 tools 16-20: Action tools (with safety gate) ----
+
+# Shared approval guidance. P5 Section C: the user was drowning in
+# confirmations (10+ for "open Notepad, open a tab, type"). The rule is now
+# that the PLAN is the only approval step — present it once as a short
+# block, then proceed. Extra confirmation questions for routine steps are
+# what caused the spam.
+_APPROVAL_RULES = (
+    "APPROVAL (the plan IS the approval — do not add more questions):\n"
+    "  1. Call WITHOUT plan_id first; that returns a plan with a one-line "
+    "description of exactly what will happen.\n"
+    "  2. Show the user that description as ONE short block.\n"
+    "  3. If they agree, call again with the returned plan_id. That is the "
+    "ONLY confirmation needed. Do NOT ask a second question per step.\n"
+    "  4. Once the user has given a go-ahead for a task, carry it out step "
+    "by step, summarizing each plan in one line as you go.\n"
+    "  5. EXCEPTION: anything matching a deny_label (delete / format / "
+    "uninstall / shut down / pay now / remove account) always needs its own "
+    "explicit confirmation, every time.\n"
+)
+
+
 @mcp.tool(
     name="click_control",
     description=(
         "ACT ON THE REAL DESKTOP — activates a control (button, menu item, checkbox...) "
-        "via its UIA pattern (Invoke > Toggle > SelectionItem > ExpandCollapse).\n"
-        "ALWAYS call without plan_id FIRST, present the plan description to the user, "
-        "and execute only after the user agrees. NEVER chain plan+execute silently.\n"
-        "Two-phase: Phase 1 (no plan_id) validates the target and returns a plan. "
-        "Phase 2 (with plan_id from Phase 1) performs the click. Plans expire after "
-        "300 seconds and can only be used once.\n"
-        "Safety gate: requires the target window's process to be in "
-        "config/actions.json allowed_processes; blocked if "
-        "config/STOP_ACTIONS exists or the control name contains deny labels.\n"
-        "Resolution order for the click: preferred UIA patterns first, falling "
-        "back to a coordinate click on the resolved control's bounding "
-        "rectangle when none are exposed. The plan description states exactly "
-        "which method will be used so the user can approve it.\n"
-        "When to use: user wants to click a button/menu item and has approved the action.\n"
-        "When NOT to use: for read-only operations — use get_ui_tree instead."
+        "via its UIA pattern (Invoke > Toggle > SelectionItem > ExpandCollapse), a "
+        "focus-free window message (BM_CLICK), or — only as a last resort — a guarded "
+        "coordinate click. The plan states exactly which method will be used.\n"
+        + _APPROVAL_RULES +
+        "If the target app is in auto_execute_processes this runs in ONE call and "
+        "returns auto_executed=true (no plan needed).\n"
+        "Consider run_sequence when a task needs several actions under ONE approval.\n"
+        "Safety gate: the target process must be in allowed_processes; blocked if "
+        "config/STOP_ACTIONS exists or the control name contains a deny label.\n"
+        "When to use: user wants a button/menu item activated.\n"
+        "When NOT to use: for reading — use get_ui_tree / get_control_text instead."
     ),
 )
 def click_control(
@@ -384,24 +408,21 @@ def click_control(
 @mcp.tool(
     name="type_text",
     description=(
-        "ACT ON THE REAL DESKTOP — types text into the resolved control.\n"
-        "Preferred path uses the standard UIA writable-pattern (SetValue-style); "
-        "when the control has no writable value pattern (e.g. Windows 11 Notepad's "
-        "DocumentControl) the planner falls back to focusing the control and typing "
-        "via Win32 Unicode input events into the caret.\n"
-        "WARNING: the writable-pattern path OVERWRITES the existing text. The keyboard "
-        "fallback types at the caret and does NOT clear existing text.\n"
-        "ALWAYS call without plan_id FIRST, present the plan description (showing "
-        "the current value AND the exact method that will be used) to the user, and "
-        "execute only after the user agrees. NEVER chain plan+execute silently.\n"
-        "Two-phase: Phase 1 (no plan_id) validates the target and returns a plan "
-        "with the control's current value and new text. Phase 2 (with plan_id) "
-        "performs the write. Plans expire after 300 seconds and can only be used once.\n"
-        "Safety gate: requires the target window's process to be in "
-        "config/actions.json allowed_processes; blocked if "
-        "config/STOP_ACTIONS exists or the control name contains deny labels.\n"
-        "When to use: user wants to type into a text field and has approved the action.\n"
-        "When NOT to use: for read-only text reading — use get_control_text instead."
+        "ACT ON THE REAL DESKTOP — writes text into the resolved control.\n"
+        "Method ladder, focus-free first: UIA SetValue → WM_SETTEXT → WM_CHAR / "
+        "EM_REPLACESEL / WM_PASTE (all window messages: no focus change, no IME, "
+        "exact for Vietnamese) → guarded synthetic keystrokes as a last resort. "
+        "The plan names the method. WARNING: every method except the keystroke "
+        "fallback OVERWRITES the control's whole text — the plan shows the current "
+        "value so the user can see that.\n"
+        + _APPROVAL_RULES +
+        "If the target app is in auto_execute_processes this runs in ONE call and "
+        "returns auto_executed=true (no plan needed).\n"
+        "Consider run_sequence when a task needs several actions under ONE approval.\n"
+        "Safety gate: the target process must be in allowed_processes; blocked if "
+        "config/STOP_ACTIONS exists or the control name contains a deny label.\n"
+        "When to use: user wants text written into a field.\n"
+        "When NOT to use: for reading text — use get_control_text instead."
     ),
 )
 def type_text(
@@ -418,18 +439,46 @@ def type_text(
     name="focus_window",
     description=(
         "ACT ON THE REAL DESKTOP — brings an allowlisted app's window to the "
-        "foreground via SetForegroundWindow. Confirm with the user before calling.\n"
-        "Safety gate: requires the target window's process to be in "
-        "config/actions.json allowed_processes; blocked if "
+        "foreground. No plan needed.\n"
+        "If SetForegroundWindow fails (Windows may refuse foreground changes from "
+        "a background process), this returns an honest error and never fakes success.\n"
+        "Safety gate: the target process must be in allowed_processes; blocked if "
         "config/STOP_ACTIONS exists.\n"
-        "If SetForegroundWindow fails (Windows may refuse foreground changes "
-        "from a background process), returns an honest error, never fakes success.\n"
-        "When to use: user wants to switch focus to a specific window.\n"
-        "When NOT to use: for read-only window queries — use list_windows instead."
+        "When to use: the next action needs a background window brought forward.\n"
+        "When NOT to use: for listing windows — use list_windows instead."
     ),
 )
 def focus_window(window: str) -> dict:
     return actions_mod.focus_window(window)
+
+
+@mcp.tool(
+    name="run_sequence",
+    description=(
+        "ACT ON THE REAL DESKTOP — runs an ordered list of up to 10 steps "
+        "(focus_window / click_control / type_text) under ONE approval.\n"
+        "Use this INSTEAD of calling the single-action tools repeatedly: it is the "
+        "difference between one confirmation and ten when a task needs several steps.\n"
+        "Each step is {\"action\": \"focus_window\"|\"click_control\"|\"type_text\", "
+        "\"window\": <title or hwnd>, plus \"text\" for type_text and "
+        "\"automation_id\" and/or \"name\" for click_control}.\n"
+        + _APPROVAL_RULES +
+        "ONE plan covers the whole sequence. Its token is bound to the exact step "
+        "list AND each step's resolved target and method, so reordering a step or "
+        "changing any text invalidates it. Steps run in order and the FIRST failure "
+        "aborts the rest; the result reports per-step status (done/failed/skipped).\n"
+        "If EVERY step targets an app in auto_execute_processes, the sequence runs "
+        "directly with auto_executed=true and no plan.\n"
+        "Safety gate is re-checked for EVERY step at execute time.\n"
+        "When to use: a task needs 2+ actions and the user wants one go-ahead.\n"
+        "When NOT to use: for a single action — use the specific tool directly."
+    ),
+)
+def run_sequence(
+    steps: List[dict],
+    plan_id: Optional[str] = None,
+) -> dict:
+    return actions_mod.run_sequence(steps, plan_id)
 
 
 # ---------------------- entry point ---------------------------------------
