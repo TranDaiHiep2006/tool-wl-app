@@ -24,6 +24,7 @@ import sys
 from pathlib import Path
 import tkinter as tk
 from tkinter import font as tkfont
+from tkinter import messagebox
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -42,32 +43,63 @@ from console_core import (  # noqa: E402
 FONT_CANDIDATES = ("Segoe UI", "Tahoma", "Arial", "TkDefaultFont")
 
 
-def _pick_font_family() -> str:
+def _pick_font_family(parent: tk.Misc | None = None) -> str:
     """Return the first available UI font that renders Vietnamese."""
-    probe = tk.Tk()
-    probe.withdraw()
+    # Tk allows only one live root at a time, so when a root already exists
+    # (the console window) probe through it instead of creating another.
+    owns_root = parent is None
+    probe = tk.Tk() if owns_root else parent  # type: ignore[assignment]
+    if owns_root:
+        probe.withdraw()
     try:
         available = set(tkfont.families(probe))
     finally:
-        probe.destroy()
+        if owns_root:
+            probe.destroy()
     for name in FONT_CANDIDATES:
         if name in available:
             return name
     return "TkDefaultFont"
 
 
+class InteractiveSession(ConsoleSession):
+    """A `ConsoleSession` whose approval hook is a real Tk dialog.
+
+    `ConsoleSession.approve` is abstract on purpose: headless callers
+    (`--selftest`, unit tests) inject a fixed answer instead. The shipped
+    window MUST supply a real implementation or every `type` / `click`
+    would die with `NotImplementedError`, so this subclass binds the
+    approval question to the console's own root window.
+    """
+
+    def __init__(self, root: Path, parent: tk.Misc) -> None:
+        super().__init__(root)
+        self.parent = parent
+
+    def approve(self, shown_plan: str) -> bool:
+        """Ask the user, modal, with the plan text as the dialog body."""
+        return bool(
+            messagebox.askyesno(
+                "Approve this action?",
+                shown_plan,
+                parent=self.parent,
+            )
+        )
+
+
 class ConsoleApp:
     """The Tk shell. All behaviour is delegated to ConsoleSession."""
 
     def __init__(self) -> None:
-        self.session = ConsoleSession(ROOT)
-        self.history: list[str] = []
-        self.history_pos = 0
-
         self.root = tk.Tk()
         self.root.title("tool-wl-app console")
         self.root.geometry("1000x660")
-        self.family = _pick_font_family()
+
+        self.session = InteractiveSession(ROOT, self.root)
+        self.history: list[str] = []
+        self.history_pos = 0
+
+        self.family = _pick_font_family(self.root)
         self.root.option_add("*Font", (self.family, 10))
 
         self.always_on_top = tk.BooleanVar(value=False)
@@ -186,8 +218,12 @@ class ConsoleApp:
             return ""
         if verb == "windows":
             return self.session.cmd_windows()
+        if verb == "clipboard":
+            return self.session.cmd_clipboard()
+        if verb == "ui":
+            return self.session.cmd_ui(args["window"])
         if verb == "shot":
-            return self.session.cmd_shot()
+            return self.session.cmd_shot(args.get("window", ""))
         if verb == "read":
             return self.session.cmd_read(args["window"])
         if verb == "focus":

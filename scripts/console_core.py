@@ -6,8 +6,10 @@ by `--selftest` without a window. `console.py` is the thin UI shell.
 Command grammar
 ---------------
     windows                      list open windows
-    shot                         capture the screen
-    read <window title substring>
+    ui <window title substring>  show a window's control tree
+    shot                         capture the whole screen
+    shot <window title substring> capture just that window
+    read <window title substring> | <control>
     type <window title substring> | <text>
     click <window title substring> | <control name>
     focus <window title substring>
@@ -53,7 +55,10 @@ class MCPError(Exception):
 
 HELP_TEXT = """Commands
   windows                       list open windows
-  shot                          capture the screen (returns an image ref)
+  clip                          read the Windows clipboard
+  ui <window>                   show a window's control tree (find names)
+  shot                          capture the whole screen
+  shot <window>                 capture just that window
   read <window> | <control>     read text from a specific control in a window
   type <window> | <text>        type text into a window's editable control
   click <window> | <control>    click a named control in a window
@@ -64,8 +69,12 @@ HELP_TEXT = """Commands
 <window> is a case-insensitive substring of the window title. Vietnamese
 titles work: matching is Unicode-normalized and ignores diacritic form.
 
-Action commands (type / click) run a plan first and ask 'Approve? y/n'
-in this window. Processes listed in auto_execute_processes skip the prompt.
+Tip: run `ui <window>` first — it lists the exact control names that
+`read` and `click` take.
+
+Action commands (type / click) run a plan first and pop an "Approve this
+action?" dialog in this window. Deny it and nothing happens. Processes
+listed in auto_execute_processes skip the dialog.
 
 Up/Down arrow recalls previous commands. Ctrl+L clears the output.
 """
@@ -91,11 +100,12 @@ def parse_command(raw: str) -> tuple[str, dict]:
         return ("quit" if verb == "exit" else verb), {}
     if verb == "windows":
         return "windows", {}
+    if verb == "clip":
+        return "clipboard", {}
     if verb == "shot":
-        if rest:
-            raise CommandError("'shot' takes no arguments")
-        return "shot", {}
-    if verb in ("read", "focus"):
+        # `shot` alone = whole screen; `shot <window>` = that one window.
+        return "shot", ({"window": rest} if rest else {})
+    if verb in ("read", "focus", "ui"):
         if not rest:
             raise CommandError(
                 f"'{verb}' needs a window title substring, "
@@ -339,6 +349,78 @@ def format_shot(payload: Any) -> str:
     return f"screenshot: {dims} → {path}"
 
 
+def format_clipboard(payload: Any) -> str:
+    """Render read_clipboard for the console.
+
+    Returns whatever shape the server produced so the user can copy the
+    result. Non-dict or error payloads collapse to a one-liner.
+    """
+    if not isinstance(payload, dict):
+        return str(payload)
+    if payload.get("error"):
+        return f"[!] {payload.get('error')}: {payload.get('message', '')}"
+    text = payload.get("text")
+    ctype = payload.get("type")
+    if not text:
+        # An empty (or absent) text payload is the normal empty-clipboard
+        # case — say so plainly instead of printing a blank "[text] ".
+        return f"(clipboard is empty / type={ctype!r})"
+    shown = text if len(text) <= MAX_TEXT_CHARS else text[:MAX_TEXT_CHARS] + " ..."
+    return f"[{ctype or 'text'}] {shown}"
+
+
+def format_ui(payload: Any) -> str:
+    """Render get_ui_tree so a human can find control names to read/click.
+
+    The console cannot read a control whose name it does not know, so the
+    UI tree is how you discover the exact `Name` / `AutomationId` values
+    that `read` and `click` take. `get_ui_tree` returns a FLAT `nodes`
+    list (each with control_type / name / automation_id and no parent
+    links), so this renders one line per node in traversal order.
+    """
+    if not isinstance(payload, dict):
+        return str(payload)
+    if payload.get("error"):
+        return f"[!] {payload.get('error')}: {payload.get('message', '')}"
+
+    nodes = payload.get("nodes")
+    if nodes is None:
+        tree = payload.get("tree") or payload.get("ui_tree")
+        if isinstance(tree, dict):
+            nodes = [tree]
+        else:
+            nodes = None
+
+    if not nodes:
+        if payload.get("window_title"):
+            return f"{payload.get('window_title')}: (no named controls found)"
+        return "(no UI tree returned)"
+
+    header_bits = [
+        str(payload.get("window_title") or "?"),
+        f"hwnd={payload.get('hwnd', '?')}",
+        f"{len(nodes)} node(s)",
+    ]
+    if payload.get("truncated"):
+        header_bits.append("TRUNCATED")
+
+    lines = ["— " + " | ".join(header_bits) + " —"]
+    budget = MAX_TEXT_CHARS // 2
+    for node in nodes[:budget]:
+        if not isinstance(node, dict):
+            continue
+        ctype = node.get("control_type") or "?"
+        name = (node.get("name") or "").strip()
+        aid = (node.get("automation_id") or "").strip()
+        bits = [ctype, f"name={name!r}"]
+        if aid:
+            bits.append(f"id={aid!r}")
+        lines.append("  " + ", ".join(bits))
+    if len(nodes) > budget:
+        lines.append(f"… ({len(nodes) - budget} more nodes not shown)")
+    return "\n".join(lines)
+
+
 def format_read(payload: Any, max_chars: int = MAX_TEXT_CHARS) -> str:
     """Compact rendering of get_control_text, truncating long text."""
     if not isinstance(payload, dict):
@@ -400,8 +482,23 @@ class ConsoleSession:
     def cmd_windows(self) -> str:
         return format_windows(self.client.call_tool("list_windows", {}))
 
-    def cmd_shot(self) -> str:
-        return format_shot(self.client.call_tool("screenshot", {"mode": "screen"}))
+    def cmd_clipboard(self) -> str:
+        return format_clipboard(self.client.call_tool("read_clipboard", {}))
+
+    def cmd_ui(self, window: str) -> str:
+        return format_ui(self.client.call_tool("get_ui_tree", {"window": window}))
+
+    def cmd_shot(self, window: str = "") -> str:
+        # `shot` alone grabs the whole screen; `shot <window>` targets a
+        # single window, which is what the screenshot tool's window mode
+        # expects (mode="window" + window=<title or hwnd>).
+        if not window:
+            payload = self.client.call_tool("screenshot", {"mode": "screen"})
+        else:
+            payload = self.client.call_tool(
+                "screenshot", {"mode": "window", "window": window}
+            )
+        return format_shot(payload)
 
     def cmd_read(self, window: str) -> str:
         # `read <window>` alone reads the focused control inside the window;

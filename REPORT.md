@@ -2421,3 +2421,141 @@ a9046f4 docs(p5): fill in P5 commit hash in REPORT
 `https://github.com/TranDaiHiep2006/tool-wl-app`.
 
 (End of P5 Console.)
+---
+
+# P5-C — Section D completion audit
+
+The console already existed and its first test run was green
+(`275 passed, 1 skipped`, selftest `ALL CHECKS PASSED`). That was not
+enough: the audit below re-read the code against the real MCP tool
+schemas and the real Tk entry path, and found that a green suite was
+hiding three defects. Each is fixed and now covered by a test that fails
+without the fix.
+
+## 1. `type` and `click` were dead in the shipped window
+
+`ConsoleSession.approve()` raises `NotImplementedError` by design, so
+headless callers inject a fixed answer. The Tk window constructed a plain
+`ConsoleSession` and never overrode it:
+
+```
+>>> s = ConsoleSession(ROOT); s.approve("PLAN")
+NotImplementedError
+```
+
+So the two commands the console exists for — the ones that touch the
+real desktop — crashed the moment a user typed them. Nothing caught this
+because the selftest never drove `_plan_then_execute`, and the parser
+tests stop at `parse_command`.
+
+**Fix:** `InteractiveSession` in `scripts/console.py` binds the approval
+question to a real modal dialog (`messagebox.askyesno`, parented to the
+console root), and `ConsoleApp` constructs that instead.
+
+**Evidence — the window smoke run:**
+
+```
+window title : tool-wl-app console
+font family  : Segoe UI
+status label : server ready (19 tools)
+session type : InteractiveSession
+approve bound: True
+approve is   : InteractiveSession.approve
+help ok      : True
+```
+
+The same run also fixed a second Tk defect: `_pick_font_family()`
+created its own `tk.Tk()` probe, which is illegal once the console's root
+exists. It now probes through the existing root.
+
+## 2. `shot` could never target a window
+
+The real tool is `screenshot(mode, window, x, y, w, h)` — `window` is
+only read in `mode="window"`. The console hard-coded `{"mode":
+"screen"}`, so there was no way to capture a single window.
+
+**Fix:** `shot` alone = whole screen; `shot <window>` = `{"mode":
+"window", "window": ...}`, mapped in `cmd_shot` and covered by
+`test_cmd_shot_screen_mode_sends_mode_only` /
+`test_cmd_shot_window_mode_targets_the_window`.
+
+## 3. The console could not tell you a control's name
+
+`read` and `click` both need a control name, and the console gave no way
+to discover one — `get_ui_tree` was registered on the server but not
+reachable from the window. The result is a console that cannot complete
+a read even when the target window is open.
+
+**Fix:** new `ui <window>` command backed by `get_ui_tree`, plus a
+`format_ui` renderer written against the tool's *real* return shape — a
+flat `nodes` list with `control_type` / `name` / `automation_id` and no
+parent links (the first draft assumed a nested tree and would have
+printed nothing). Also added `clip` (`read_clipboard`), which is the one
+read-only tool whose payload stays small.
+
+`read`'s pipe split is now pinned by a test asserting the tool call is
+exactly `{"window": "Notepad", "automation_id_or_name": "Text editor"}`,
+matching the server signature.
+
+## 4. A real, separate upstream defect found by the new tests
+
+Driving a live `tools/call` — which the previous suite never did — hung,
+and the cause is not in Section D:
+
+```
+ValueError: structured_content must be a dict or None. Got list:
+[{'title': '(542) Crossfire Legends ...', 'process_name': 'firefox.exe',
+  'pid': 18424, 'hwnd': 92931884, ...}]
+```
+
+`list_windows` returns a bare list while its `output_schema` demands a
+dict, so FastMCP rejects it and emits a multi-kilobyte error string back
+over stdout. The console client then waits on it. This affects every
+MCP client, including Cursor — it is a server bug in
+`server/mcp_server.py`, **not** a Section D bug, and it is left
+unfixed here and reported separately.
+
+The live `tools/call` assertion is therefore deliberately omitted from
+`--selftest`, with a comment naming the cause. The console's dispatch
+path is still proved against the live server via `cmd_clipboard`, which
+uses a tool that is not affected. Everything else — transport,
+`initialize`, `tools/list`, all 19 tools — is exercised live.
+
+## 5. Verification
+
+```
+$ python scripts/console.py --selftest
+...
+  approval flow (plan -> approve -> execute)
+  [PASS] base ConsoleSession.approve is abstract
+  [PASS] approved flow executes with the plan_id   calls=2
+  [PASS] approved flow shows the plan then the result
+  [PASS] declining executes nothing   calls=1
+  [PASS] declining says nothing was done
+  [PASS] auto-executed skips the approval question   asked=0
+...
+  MCP live subprocess round-trip (stdio JSON-RPC)
+  [PASS] live init+tools/list (n=19)
+  [PASS] cmd_clipboard reaches the live server
+
+  ALL CHECKS PASSED
+```
+
+```
+$ python scripts/console.bat --selftest      # launcher path
+Starting tool-wl-app console...
+  ALL CHECKS PASSED
+```
+
+```
+$ python -m pytest -q
+296 passed, 1 skipped in 28.25s
+```
+
+Up from 275 — 21 new cases covering dispatch argument mapping, the
+approval contract, and the formatters. One of them caught a further
+defect: `format_clipboard` rendered an empty clipboard as `[text] `, now
+reported as `(clipboard is empty / type='text')`.
+
+The 1 skipped is the same environment-sensitive desktop test from §6.5
+below, unchanged.
